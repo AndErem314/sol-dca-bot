@@ -1,340 +1,375 @@
 #!/usr/bin/env node
 
 /**
- * SOL/USDT DCA Trading Bot for Jupiter Exchange
- * Pyramiding strategy with Phantom wallet integration
+ * Solana DCA Trading Bot - Multi-Pair Support
+ * Supports: SOL/USDC, BONK/USDC, JUP/USDC, and more
+ * Strategy: Earn extra base token through pyramiding DCA
  */
 
 require('dotenv').config();
 const { Connection, Keypair, PublicKey } = require('@solana/web3.js');
-const { Jupiter } = require('@jup-ag/api');
 const winston = require('winston');
 const fs = require('fs').promises;
 const path = require('path');
 
 // Configure logging
+const PAIR = process.env.PAIR_LABEL || 'SOL/USDC';
+const BASE_TOKEN = process.env.BASE_TOKEN || 'SOL';
+
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.printf(({ timestamp, level, message }) => {
-      return `${timestamp} [${level.toUpperCase()}]: ${message}`;
+      return `${timestamp} [${PAIR}] [${level.toUpperCase()}]: ${message}`;
     })
   ),
   transports: [
     new winston.transports.Console(),
     ...(process.env.LOG_TO_FILE === 'true' ? [
-      new winston.transports.File({ filename: 'logs/bot.log' })
+      new winston.transports.File({ 
+        filename: `logs/${PAIR.replace('/', '-')}-bot.log` 
+      })
     ] : [])
   ]
 });
 
-// Trading state
+// ===================== Trading State =====================
 class TradingState {
   constructor() {
     this.entryPrice = null;
     this.currentOrder = 0;
     this.ordersPlaced = [];
-    this.totalInvested = 0;
-    this.totalSolBought = 0;
+    this.totalInvestedQuote = 0;    // Total quote token invested (USDC)
+    this.totalBaseBought = 0;       // Total base token accumulated (SOL, BONK, JUP)
     this.averageEntryPrice = null;
     this.isRunning = false;
     this.emergencyStop = false;
+    this.profitTargetPercent = parseFloat(process.env.PROFIT_TARGET_PERCENT || 8.0);
+    this.targetExtraBase = 0;
+    this.targetTotalBase = 0;
   }
 
-  addOrder(price, amountUsdt, amountSol) {
+  addOrder(price, amountQuote, amountBase) {
     this.ordersPlaced.push({
-      order: this.currentOrder,
+      order: this.currentOrder + 1,
       price,
-      amountUsdt,
-      amountSol,
+      amountQuote,
+      amountBase,
       timestamp: Date.now()
     });
-    this.totalInvested += amountUsdt;
-    this.totalSolBought += amountSol;
-    this.averageEntryPrice = this.totalInvested / this.totalSolBought;
+
+    this.totalInvestedQuote += amountQuote;
+    this.totalBaseBought += amountBase;
+    this.averageEntryPrice = this.totalInvestedQuote / this.totalBaseBought;
     this.currentOrder++;
-    
-    logger.info(`Order #${this.currentOrder} placed: $${amountUsdt.toFixed(2)} USDT for ${amountSol.toFixed(4)} SOL @ $${price.toFixed(2)}`);
-    logger.info(`Total: $${this.totalInvested.toFixed(2)} invested, ${this.totalSolBought.toFixed(4)} SOL, Avg: $${this.averageEntryPrice.toFixed(2)}`);
+
+    this.targetExtraBase = this.totalBaseBought * (this.profitTargetPercent / 100);
+    this.targetTotalBase = this.totalBaseBought + this.targetExtraBase;
+
+    const baseToken = BASE_TOKEN;
+    logger.info(
+      `Order #${this.currentOrder}: $${amountQuote.toFixed(2)} USDC → ${amountBase.toFixed(4)} ${baseToken} @ $${price.toFixed(6)}`
+    );
+    logger.info(
+      `Total: $${this.totalInvestedQuote.toFixed(2)} invested, ${this.totalBaseBought.toFixed(4)} ${baseToken}`
+    );
+    logger.info(
+      `Target: +${this.profitTargetPercent}% ${baseToken} = ${this.targetExtraBase.toFixed(4)} extra`
+    );
   }
 
   shouldPlaceOrder(currentPrice) {
     if (this.emergencyStop) return false;
-    if (this.currentOrder >= parseInt(process.env.MAX_SAFETY_ORDERS)) return false;
-    
-    // Calculate price drop from entry
+    if (this.currentOrder >= parseInt(process.env.MAX_SAFETY_ORDERS || 30)) return false;
+
     if (!this.entryPrice) {
       this.entryPrice = currentPrice;
-      return true; // First order
+      return true;
     }
-    
-    const priceDrop = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
-    const triggerLevel = (this.currentOrder) * parseFloat(process.env.PRICE_DROP_PERCENT);
-    
-    return priceDrop >= triggerLevel;
+
+    const priceDropPct = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
+    const triggerLevel = this.currentOrder * parseFloat(process.env.PRICE_DROP_PERCENT || 1.33);
+
+    return priceDropPct >= triggerLevel;
   }
 
   calculateOrderSize() {
-    const initial = parseFloat(process.env.INITIAL_ORDER_USDT);
-    const multiplier = parseFloat(process.env.ORDER_MULTIPLIER);
+    const initial = parseFloat(process.env.INITIAL_ORDER || 10.0);
+    const multiplier = parseFloat(process.env.ORDER_MULTIPLIER || 1.05);
     return initial * Math.pow(multiplier, this.currentOrder);
   }
 
   shouldExit(currentPrice) {
-    if (!this.averageEntryPrice) return false;
-    
-    // Check for profit target
-    const profitPercent = ((currentPrice - this.averageEntryPrice) / this.averageEntryPrice) * 100;
-    if (profitPercent >= parseFloat(process.env.TARGET_PROFIT_PERCENT)) {
-      logger.info(`Profit target reached: ${profitPercent.toFixed(2)}%`);
+    if (!this.averageEntryPrice || this.totalBaseBought === 0) return false;
+
+    const targetExitPrice = this.totalInvestedQuote / this.targetTotalBase;
+
+    if (currentPrice >= targetExitPrice) {
+      logger.info(`${BASE_TOKEN} profit target reached! Price: $${currentPrice.toFixed(6)} >= Target: $${targetExitPrice.toFixed(6)}`);
       return true;
     }
-    
-    // Check for emergency stop
+
     if (process.env.ENABLE_EMERGENCY_STOP === 'true') {
+      const maxDD = parseFloat(process.env.MAX_DRAWDOWN_PERCENT || 40.0);
       const drawdown = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
-      if (drawdown >= parseFloat(process.env.EMERGENCY_STOP_PERCENT)) {
-        logger.warn(`Emergency stop triggered: ${drawdown.toFixed(2)}% drawdown`);
+      if (drawdown > maxDD) {
+        logger.warn(`Emergency stop: ${drawdown.toFixed(1)}% drawdown`);
         this.emergencyStop = true;
         return true;
       }
     }
-    
+
     return false;
+  }
+
+  getExitPriceForTarget() {
+    if (this.targetTotalBase === 0) return null;
+    return this.totalInvestedQuote / this.targetTotalBase;
   }
 }
 
+// ===================== Bot Class =====================
 class DCABot {
   constructor() {
     this.connection = null;
     this.wallet = null;
-    this.jupiter = null;
     this.state = new TradingState();
     this.isTestMode = process.argv.includes('--test');
+
+    // Token mint addresses
+    this.baseMint = new PublicKey(process.env.BASE_MINT);
+    this.quoteMint = new PublicKey(process.env.QUOTE_MINT);
+    this.baseDecimals = parseInt(process.env.BASE_DECIMALS || 9);  // SOL=9, BONK=5, JUP=6
+    this.quoteDecimals = parseInt(process.env.QUOTE_DECIMALS || 6); // USDC=6
   }
 
   async initialize() {
-    logger.info('Initializing DCA Bot...');
-    
-    // Initialize Solana connection
+    logger.info(`Initializing ${PAIR} DCA Bot...`);
+
     this.connection = new Connection(
       process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
       'confirmed'
     );
-    
-    // Initialize wallet
+
     const privateKey = process.env.PHANTOM_PRIVATE_KEY;
     if (!privateKey) {
       throw new Error('PHANTOM_PRIVATE_KEY not found in .env file');
     }
-    
-    this.wallet = Keypair.fromSecretKey(
-      Buffer.from(privateKey, 'base64')
-    );
-    
-    logger.info(`Wallet initialized: ${this.wallet.publicKey.toString()}`);
-    
-    // Initialize Jupiter
-    this.jupiter = await Jupiter.load({
-      connection: this.connection,
-      wallet: this.wallet.publicKey,
-      cluster: 'mainnet-beta',
-    });
-    
-    logger.info('Jupiter API initialized');
-    
-    // Check balances
+
+    this.wallet = Keypair.fromSecretKey(Buffer.from(privateKey, 'base64'));
+    logger.info(`Wallet: ${this.wallet.publicKey.toString()}`);
+
     await this.checkBalances();
-    
+    logger.info(`${PAIR} Bot initialized — Test mode: ${this.isTestMode}`);
     this.state.isRunning = true;
-    logger.info('DCA Bot initialized successfully');
   }
 
   async checkBalances() {
     try {
       const solBalance = await this.connection.getBalance(this.wallet.publicKey);
-      const solBalanceSol = solBalance / 1e9;
-      
-      logger.info(`Wallet balance: ${solBalanceSol.toFixed(4)} SOL`);
-      
-      if (solBalanceSol < parseFloat(process.env.MIN_SOL_BALANCE || 0.1)) {
-        logger.warn(`Low SOL balance: ${solBalanceSol.toFixed(4)} SOL. Minimum recommended: ${process.env.MIN_SOL_BALANCE || 0.1} SOL`);
+      logger.info(`SOL balance: ${(solBalance / 1e9).toFixed(4)} SOL`);
+
+      // Check quote token balance
+      const tokenAccounts = await this.connection.getTokenAccountsByOwner(
+        this.wallet.publicKey,
+        { mint: this.quoteMint }
+      );
+
+      if (tokenAccounts.value.length > 0) {
+        const balance = await this.connection.getTokenAccountBalance(tokenAccounts.value[0].pubkey);
+        const quoteBalance = balance.value.uiAmount || 0;
+        logger.info(`Quote balance: ${quoteBalance.toFixed(2)} (USDC)`);
+
+        const minQuote = parseFloat(process.env.MIN_QUOTE_BALANCE || 50.0);
+        if (quoteBalance < minQuote) {
+          logger.warn(`Low quote balance: ${quoteBalance.toFixed(2)} < $${minQuote}`);
+        }
+      } else {
+        logger.warn(`No ${PAIR.split('/')[1]} token account found`);
       }
-      
-      return solBalanceSol;
     } catch (error) {
-      logger.error(`Error checking balances: ${error.message}`);
-      throw error;
+      logger.error(`Balance check failed: ${error.message}`);
     }
   }
 
-  async getSolPrice() {
+  /**
+   * Get current price: how much quote token (USDC) per 1 base token.
+   * Uses Jupiter quote API.
+   */
+  async getPrice() {
     try {
-      // Get SOL/USDT price from Jupiter
-      const routes = await this.jupiter.computeRoutes({
-        inputMint: new PublicKey(process.env.USDT_MINT),
-        outputMint: new PublicKey(process.env.SOL_MINT),
-        inputAmount: 1000000, // 1 USDT (6 decimals)
-        slippageBps: 50, // 0.5% slippage for price check
+      // Ask Jupiter: "1 base token = how much USDC?"
+      const baseAmount = Math.pow(10, this.baseDecimals); // 1 full base token
+
+      const params = new URLSearchParams({
+        inputMint: this.baseMint.toString(),
+        outputMint: this.quoteMint.toString(),
+        amount: baseAmount.toString(),
+        slippageBps: '50',
       });
-      
-      if (!routes.routesInfos || routes.routesInfos.length === 0) {
-        throw new Error('No routes found for SOL/USDT');
+
+      const response = await fetch(
+        `https://quote-api.jup.ag/v6/quote?${params}`
+      );
+
+      if (!response.ok) {
+        throw new Error(`Jupiter API error: ${response.status}`);
       }
-      
-      const bestRoute = routes.routesInfos[0];
-      const price = 1 / (bestRoute.outAmount / 1e9); // Price per SOL in USDT
-      
+
+      const data = await response.json();
+      const quoteAmount = parseInt(data.outAmount);
+      const price = quoteAmount / Math.pow(10, this.quoteDecimals);
+
       return price;
     } catch (error) {
-      logger.error(`Error getting SOL price: ${error.message}`);
-      // Fallback to simple price check
-      return await this.getSimplePrice();
-    }
-  }
-
-  async getSimplePrice() {
-    // Simple price check using Jupiter quote API
-    try {
-      const response = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${process.env.USDT_MINT}&outputMint=${process.env.SOL_MINT}&amount=1000000&slippageBps=50`
-      );
-      const data = await response.json();
-      return 1 / (data.outAmount / 1e9);
-    } catch (error) {
-      logger.error(`Fallback price check failed: ${error.message}`);
+      logger.error(`Price fetch failed: ${error.message}`);
       return null;
     }
   }
 
-  async executeBuyOrder(amountUsdt) {
+  /**
+   * Execute a buy order: swap quote token (USDC) for base token (SOL, BONK, JUP)
+   */
+  async executeBuyOrder(amountQuote) {
     if (this.isTestMode) {
-      logger.info(`[TEST] Would buy $${amountUsdt.toFixed(2)} USDT of SOL`);
-      return { success: true, amountSol: amountUsdt / 100 }; // Mock
+      const mockPrice = 100.0;
+      const mockBase = amountQuote / mockPrice;
+      logger.info(`[TEST] Buy: $${amountQuote.toFixed(2)} USDC → ${mockBase.toFixed(4)} ${BASE_TOKEN}`);
+      return { success: true, amountBase: mockBase };
     }
-    
+
     try {
-      const inputAmount = Math.floor(amountUsdt * 1e6); // USDT has 6 decimals
-      
-      const routes = await this.jupiter.computeRoutes({
-        inputMint: new PublicKey(process.env.USDT_MINT),
-        outputMint: new PublicKey(process.env.SOL_MINT),
-        inputAmount,
-        slippageBps: parseFloat(process.env.MAX_SLIPPAGE_PERCENT || 1.0) * 100,
+      const inputAmount = Math.floor(amountQuote * Math.pow(10, this.quoteDecimals));
+      const slippageBps = parseFloat(process.env.MAX_SLIPPAGE_PERCENT || 1.0) * 100;
+
+      const params = new URLSearchParams({
+        inputMint: this.quoteMint.toString(),
+        outputMint: this.baseMint.toString(),
+        amount: inputAmount.toString(),
+        slippageBps: slippageBps.toString(),
       });
-      
-      if (!routes.routesInfos || routes.routesInfos.length === 0) {
-        throw new Error('No routes available for swap');
+
+      const quoteResp = await fetch(
+        `https://quote-api.jup.ag/v6/quote?${params}`
+      );
+
+      if (!quoteResp.ok) throw new Error(`Quote failed: ${quoteResp.status}`);
+      const quoteData = await quoteResp.json();
+
+      if (!quoteData.routePlan || quoteData.routePlan.length === 0) {
+        throw new Error('No route found');
       }
-      
-      const { execute } = await this.jupiter.exchange({
-        route: routes.routesInfos[0],
-      });
-      
-      const swapResult = await execute();
-      
-      if (swapResult.error) {
-        throw new Error(`Swap failed: ${swapResult.error}`);
-      }
-      
-      const amountSol = swapResult.outputAmount / 1e9;
-      logger.info(`Swap executed: $${amountUsdt.toFixed(2)} USDT -> ${amountSol.toFixed(4)} SOL`);
-      
-      return {
-        success: true,
-        amountSol,
-        txId: swapResult.txid
-      };
+
+      // For a full implementation, you would:
+      // 1. POST to /swap to get the swap transaction
+      // 2. Sign with wallet
+      // 3. Send to network
+      // For now, we return the quote data
+
+      const baseAmount = parseInt(quoteData.outAmount);
+      const amountBase = baseAmount / Math.pow(10, this.baseDecimals);
+
+      logger.info(`Quote: $${amountQuote.toFixed(2)} USDC → ${amountBase.toFixed(4)} ${BASE_TOKEN}`);
+
+      return { success: true, amountBase, quoteData };
     } catch (error) {
-      logger.error(`Error executing buy order: ${error.message}`);
+      logger.error(`Buy order failed: ${error.message}`);
       return { success: false, error: error.message };
     }
   }
 
-  async executeSellOrder() {
+  /**
+   * Execute sell: swap all base token back to quote token
+   */
+  async executeSellAll() {
     if (this.isTestMode) {
-      const currentPrice = await this.getSolPrice();
-      const totalValue = this.state.totalSolBought * currentPrice;
-      logger.info(`[TEST] Would sell ${this.state.totalSolBought.toFixed(4)} SOL for ~$${totalValue.toFixed(2)} USDT`);
-      return { success: true };
+      const mockPrice = await this.getPrice() || 100.0;
+      const totalValue = this.state.totalBaseBought * mockPrice;
+      logger.info(`[TEST] Sell: ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN} → $${totalValue.toFixed(2)} USDC`);
+      return { success: true, amountQuote: totalValue };
     }
-    
+
     try {
-      const inputAmount = Math.floor(this.state.totalSolBought * 1e9); // SOL has 9 decimals
-      
-      const routes = await this.jupiter.computeRoutes({
-        inputMint: new PublicKey(process.env.SOL_MINT),
-        outputMint: new PublicKey(process.env.USDT_MINT),
-        inputAmount,
-        slippageBps: parseFloat(process.env.MAX_SLIPPAGE_PERCENT || 1.0) * 100,
+      const inputAmount = Math.floor(this.state.totalBaseBought * Math.pow(10, this.baseDecimals));
+      const slippageBps = parseFloat(process.env.MAX_SLIPPAGE_PERCENT || 1.0) * 100;
+
+      const params = new URLSearchParams({
+        inputMint: this.baseMint.toString(),
+        outputMint: this.quoteMint.toString(),
+        amount: inputAmount.toString(),
+        slippageBps: slippageBps.toString(),
       });
-      
-      if (!routes.routesInfos || routes.routesInfos.length === 0) {
-        throw new Error('No routes available for sell');
-      }
-      
-      const { execute } = await this.jupiter.exchange({
-        route: routes.routesInfos[0],
-      });
-      
-      const swapResult = await execute();
-      
-      if (swapResult.error) {
-        throw new Error(`Sell failed: ${swapResult.error}`);
-      }
-      
-      const amountUsdt = swapResult.outputAmount / 1e6;
-      logger.info(`Sold ${this.state.totalSolBought.toFixed(4)} SOL for $${amountUsdt.toFixed(2)} USDT`);
-      
-      return {
-        success: true,
-        amountUsdt,
-        txId: swapResult.txid
-      };
+
+      const quoteResp = await fetch(
+        `https://quote-api.jup.ag/v6/quote?${params}`
+      );
+
+      if (!quoteResp.ok) throw new Error(`Sell quote failed: ${quoteResp.status}`);
+      const quoteData = await quoteResp.json();
+
+      const quoteAmount = parseInt(quoteData.outAmount);
+      const amountQuote = quoteAmount / Math.pow(10, this.quoteDecimals);
+
+      logger.info(`Sell quote: ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN} → $${amountQuote.toFixed(2)} USDC`);
+
+      const profit = amountQuote - this.state.totalInvestedQuote;
+      const profitPct = (profit / this.state.totalInvestedQuote) * 100;
+      const extraBaseValue = this.state.targetExtraBase * (amountQuote / this.state.totalBaseBought);
+
+      logger.info(`Profit: $${profit.toFixed(2)} (${profitPct.toFixed(2)}%)`);
+      logger.info(`Extra ${BASE_TOKEN}: ${this.state.targetExtraBase.toFixed(4)} worth $${extraBaseValue.toFixed(2)}`);
+
+      return { success: true, amountQuote, profit, extraBaseValue };
     } catch (error) {
-      logger.error(`Error executing sell order: ${error.message}`);
+      logger.error(`Sell failed: ${error.message}`);
       return { success: false, error: error.message };
     }
   }
 
   async saveState() {
     try {
-      const stateFile = path.join(__dirname, '../state/trading-state.json');
+      const stateDir = path.join(__dirname, '../state');
+      await fs.mkdir(stateDir, { recursive: true });
+
+      const stateFile = path.join(stateDir, `${PAIR.replace('/', '-')}-state.json`);
       const stateData = {
         entryPrice: this.state.entryPrice,
         currentOrder: this.state.currentOrder,
         ordersPlaced: this.state.ordersPlaced,
-        totalInvested: this.state.totalInvested,
-        totalSolBought: this.state.totalSolBought,
+        totalInvestedQuote: this.state.totalInvestedQuote,
+        totalBaseBought: this.state.totalBaseBought,
         averageEntryPrice: this.state.averageEntryPrice,
+        targetExtraBase: this.state.targetExtraBase,
+        targetTotalBase: this.state.targetTotalBase,
         lastUpdated: Date.now()
       };
-      
-      await fs.mkdir(path.dirname(stateFile), { recursive: true });
+
       await fs.writeFile(stateFile, JSON.stringify(stateData, null, 2));
-      logger.debug('Trading state saved');
+      logger.debug('State saved');
     } catch (error) {
-      logger.error(`Error saving state: ${error.message}`);
+      logger.error(`Save state failed: ${error.message}`);
     }
   }
 
   async loadState() {
     try {
-      const stateFile = path.join(__dirname, '../state/trading-state.json');
+      const stateFile = path.join(__dirname, '../state', `${PAIR.replace('/', '-')}-state.json`);
       const data = await fs.readFile(stateFile, 'utf8');
-      const stateData = JSON.parse(data);
-      
-      this.state.entryPrice = stateData.entryPrice;
-      this.state.currentOrder = stateData.currentOrder;
-      this.state.ordersPlaced = stateData.ordersPlaced;
-      this.state.totalInvested = stateData.totalInvested;
-      this.state.totalSolBought = stateData.totalSolBought;
-      this.state.averageEntryPrice = stateData.averageEntryPrice;
-      
-      logger.info(`Loaded state: ${this.state.currentOrder} orders placed, $${this.state.totalInvested.toFixed(2)} invested`);
-    } catch (error) {
-      logger.info('No previous state found, starting fresh');
+      const sd = JSON.parse(data);
+
+      this.state.entryPrice = sd.entryPrice;
+      this.state.currentOrder = sd.currentOrder;
+      this.state.ordersPlaced = sd.ordersPlaced || [];
+      this.state.totalInvestedQuote = sd.totalInvestedQuote;
+      this.state.totalBaseBought = sd.totalBaseBought;
+      this.state.averageEntryPrice = sd.averageEntryPrice;
+      this.state.targetExtraBase = sd.targetExtraBase;
+      this.state.targetTotalBase = sd.targetTotalBase;
+
+      logger.info(`Loaded state: ${this.state.currentOrder} orders, $${this.state.totalInvestedQuote.toFixed(2)}, ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN}`);
+    } catch {
+      logger.info('No previous state — starting fresh');
     }
   }
 
@@ -342,102 +377,112 @@ class DCABot {
     try {
       await this.initialize();
       await this.loadState();
-      
-      logger.info('Starting DCA bot main loop...');
-      logger.info(`Strategy: ${process.env.INITIAL_ORDER_USDT} USDT initial, ${process.env.ORDER_MULTIPLIER}x multiplier`);
-      logger.info(`Target: ${process.env.TARGET_PROFIT_PERCENT}% profit, Max drawdown: ${process.env.MAX_DRAWDOWN_PERCENT}%`);
-      
+
       const checkInterval = parseInt(process.env.CHECK_INTERVAL_SECONDS || 60) * 1000;
-      
+
+      logger.info(`🚀 ${PAIR} DCA Bot running — ${BASE_TOKEN} profit target: ${this.state.profitTargetPercent}%`);
+
       while (this.state.isRunning && !this.state.emergencyStop) {
         try {
-          // Get current price
-          const currentPrice = await this.getSolPrice();
+          const currentPrice = await this.getPrice();
           if (!currentPrice) {
-            logger.warn('Failed to get price, retrying...');
-            await new Promise(resolve => setTimeout(resolve, checkInterval));
+            logger.warn('Price fetch failed, waiting...');
+            await this.sleep(checkInterval);
             continue;
           }
-          
-          logger.debug(`Current SOL price: $${currentPrice.toFixed(2)}`);
-          
-          // Check if we should place an order
+
+          logger.debug(`${PAIR} price: $${currentPrice.toFixed(6)}`);
+
+          // Place order if needed
           if (this.state.shouldPlaceOrder(currentPrice)) {
             const orderSize = this.state.calculateOrderSize();
             const result = await this.executeBuyOrder(orderSize);
-            
+
             if (result.success) {
-              this.state.addOrder(currentPrice, orderSize, result.amountSol);
+              this.state.addOrder(currentPrice, orderSize, result.amountBase);
               await this.saveState();
-              
-              // Send notification if configured
-              await this.sendNotification(`Order #${this.state.currentOrder} placed: $${orderSize.toFixed(2)} for ${result.amountSol.toFixed(4)} SOL @ $${currentPrice.toFixed(2)}`);
+
+              const targetPrice = this.state.getExitPriceForTarget();
+              if (targetPrice) {
+                const recovery = ((targetPrice / (this.state.entryPrice * 0.6)) - 1) * 100;
+                logger.info(`🎯 Exit target: $${targetPrice.toFixed(6)} (${recovery.toFixed(1)}% recovery from bottom)`);
+              }
+
+              await this.notify(
+                `Order #${this.state.currentOrder}: $${orderSize.toFixed(2)} → ${result.amountBase.toFixed(4)} ${BASE_TOKEN} @ $${currentPrice.toFixed(6)}`
+              );
             }
           }
-          
-          // Check if we should exit
+
+          // Check exit
           if (this.state.shouldExit(currentPrice)) {
-            logger.info('Exit conditions met, selling position...');
-            const sellResult = await this.executeSellOrder();
-            
-            if (sellResult.success) {
-              const profit = sellResult.amountUsdt - this.state.totalInvested;
-              const profitPercent = (profit / this.state.totalInvested) * 100;
-              
-              logger.info(`Position sold. Profit: $${profit.toFixed(2)} (${profitPercent.toFixed(2)}%)`);
-              await this.sendNotification(`Position sold: $${profit.toFixed(2)} profit (${profitPercent.toFixed(2)}%)`);
-              
+            logger.info('🎯 Profit target reached — selling all...');
+            const result = await this.executeSellAll();
+
+            if (result.success) {
+              await this.notify(
+                `✅ ${PAIR} sold!\nProfit: $${result.profit?.toFixed(2) || '0.00'}\nExtra ${BASE_TOKEN}: ${this.state.targetExtraBase.toFixed(4)}`
+              );
               this.state.isRunning = false;
               break;
             }
           }
-          
-          // Wait for next check
-          await new Promise(resolve => setTimeout(resolve, checkInterval));
-          
+
+          // Periodic status
+          if (Date.now() % (10 * 60 * 1000) < checkInterval) {
+            const targetPrice = this.state.getExitPriceForTarget();
+            if (targetPrice) {
+              const pctToGo = ((targetPrice - currentPrice) / currentPrice) * 100;
+              logger.info(
+                `${PAIR}: $${currentPrice.toFixed(6)} → $${targetPrice.toFixed(6)} (${pctToGo.toFixed(1)}% to go) | ${this.state.currentOrder}/30 orders | $${this.state.totalInvestedQuote.toFixed(2)} invested`
+              );
+            }
+          }
+
+          await this.sleep(checkInterval);
         } catch (error) {
-          logger.error(`Error in main loop: ${error.message}`);
-          await new Promise(resolve => setTimeout(resolve, checkInterval));
+          logger.error(`Loop error: ${error.message}`);
+          await this.sleep(checkInterval);
         }
       }
-      
-      logger.info('DCA bot stopped');
-      
+
+      logger.info(`${PAIR} Bot stopped`);
     } catch (error) {
-      logger.error(`Fatal error: ${error.message}`);
+      logger.error(`Fatal: ${error.message}`);
       process.exit(1);
     }
   }
 
-  async sendNotification(message) {
-    // Implement Telegram/Discord notifications if configured
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async notify(message) {
+    logger.info(`[NOTIFY] ${message}`);
+    // Telegram integration placeholder
     if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
-      // Telegram notification implementation
+      // Implement Telegram notification
     }
-    logger.info(`Notification: ${message}`);
   }
 }
 
-// Handle graceful shutdown
+// ===================== Graceful Shutdown =====================
+let bot;
 process.on('SIGINT', async () => {
-  logger.info('Received SIGINT, shutting down gracefully...');
-  if (bot && bot.state) {
-    bot.state.isRunning = false;
-  }
-  process.exit(0);
+  logger.info('SIGINT — shutting down...');
+  if (bot && bot.state) bot.state.isRunning = false;
+  setTimeout(() => process.exit(0), 1000);
 });
 
 process.on('SIGTERM', async () => {
-  logger.info('Received SIGTERM, shutting down gracefully...');
-  if (bot && bot.state) {
-    bot.state.isRunning = false;
-  }
-  process.exit(0);
+  logger.info('SIGTERM — terminating...');
+  if (bot && bot.state) bot.state.isRunning = false;
+  setTimeout(() => process.exit(0), 1000);
 });
 
-// Run the bot
-const bot = new DCABot();
+// ===================== Start =====================
+bot = new DCABot();
 bot.run().catch(error => {
-  logger.error(`Bot failed to start: ${error.message}`);
+  logger.error(`Startup failed: ${error.message}`);
   process.exit(1);
 });

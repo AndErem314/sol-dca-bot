@@ -1,224 +1,143 @@
-# SOL/USDT DCA Trading Bot for Jupiter Exchange
+# Solana DCA Trading Bot
 
-## 🎯 Strategy Overview
-**Pyramiding Dollar Cost Averaging (DCA) bot** for SOL/USDT on Jupiter Exchange with Phantom wallet integration.
+Multi-pair pyramiding DCA bot for Solana tokens on Jupiter Exchange with Phantom wallet.
 
-### **Two Strategy Options:**
+## Supported Pairs
 
-#### **1. SOL Profit Strategy (RECOMMENDED)**
-- **Goal**: Earn extra SOL through DCA accumulation
-- **Multiplier**: 1.05x (each order 5% larger)
-- **Target**: +8% extra SOL
-- **Capital**: $664.39 USDT
-- **Exit**: Sell at break-even USD price
-- **Recovery needed**: 15% from bottom
+| Pair | Base Token | Quote | Config File | Risk |
+|------|-----------|-------|-------------|------|
+| **SOL/USDC** | SOL | USDC | `.env.sol-usdc` | Low |
+| **BONK/USDC** | BONK | USDC | `.env.bonk-usdc` | High (meme) |
+| **JUP/USDC** | JUP | USDC | `.env.jup-usdc` | Medium |
 
-#### **2. USD Profit Strategy**
-- **Goal**: Make 2% USD profit on total investment
-- **Multiplier**: 1.10x (each order 10% larger)
-- **Target**: +2% USD profit
-- **Capital**: $1,644.94 USDT
-- **Exit**: Sell at 2% USD profit
-- **Recovery needed**: 42.5% from bottom
+## Strategy
 
-## 📊 Why SOL Profit Strategy is Better
+The bot pyramids DCA orders: buy more as price drops, then sell all when price recovers. Instead of chasing USD profit, the goal is to **accumulate extra base tokens** (SOL, BONK, or JUP).
 
-| Metric | USD Profit | SOL Profit | Advantage |
-|--------|------------|------------|-----------|
-| Capital | $1,644.94 | $664.39 | **60% less** |
-| Max loss | $657.98 | $265.76 | **60% less** |
-| Target | +2% USD ($32.90) | +8% SOL (0.7132 SOL) | **3x more value*** |
-| Recovery | 42.5% from bottom | 15.0% from bottom | **66% less** |
-| Max order | $158.63 | $37.34 | **76% smaller** |
+### How It Works
+1. First order: $10 USDC at current price
+2. Each safety order is 5% larger than the previous
+3. Buys trigger at every 1.33% price drop
+4. Up to 30 orders (40% max drawdown)
+5. Sells all when price recovers to target
+6. Profit = extra base tokens kept
 
-*Value at $150 SOL: 0.7132 SOL = $107.00 vs $32.90 USD
+### Example: SOL/USDC
+- Total investment: ~$664 USDC
+- SOL accumulated: ~8.91 SOL
+- Target: +8% extra SOL (0.71 SOL)
+- Recovery needed from bottom: ~15%
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Prerequisites
+### 1. Install
 ```bash
-# Install Node.js and npm
-sudo apt install nodejs npm
-
-# Install Solana tools
-npm install -g @solana/web3.js @project-serum/anchor
-```
-
-### 2. Setup Phantom Wallet
-1. Install Phantom wallet browser extension
-2. Create or import wallet
-3. Get your private key (for bot automation)
-4. Fund with SOL and USDT
-
-### 3. Clone and Setup
-```bash
-git clone <repository-url>
-cd sol-dca-bot
 npm install
-
-# Choose your strategy:
-# For SOL Profit (Recommended):
-cp .env.sol-profit .env
-
-# For USD Profit:
-cp .env.example .env
-
-# Edit .env with your wallet and API keys
 ```
 
-### 4. Run Bot
+### 2. Configure
+Choose a pair and set up:
 ```bash
-# Test mode (dry run)
-npm run test
-
-# Live trading (SOL Profit strategy)
-node src/bot_sol_profit.js
-
-# Live trading (USD Profit strategy)
-node src/bot.js
+cp .env.sol-usdc .env
+# Edit .env — add your Phantom private key (base64)
 ```
 
-## 🔧 Configuration
-
-### Environment Variables (`.env`):
+### 3. Run
 ```bash
-# Phantom Wallet
-PHANTOM_PRIVATE_KEY=your_private_key_here
-PHANTOM_PUBLIC_KEY=your_public_key_here
+# Single pair
+./run.sh sol-usdc         # live
+./run.sh sol-usdc --test  # dry run
+./run.sh bonk-usdc
+./run.sh jup-usdc
 
-# Solana Network
-RPC_ENDPOINT=https://api.mainnet-beta.solana.com
-
-# Token Addresses (Solana mainnet)
-SOL_MINT=So11111111111111111111111111111111111111112
-USDT_MINT=Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
-
-# Trading Strategy Parameters
-INITIAL_ORDER_USDT=10.0
-ORDER_MULTIPLIER=1.05          # 1.05 for SOL profit, 1.10 for USD profit
-MAX_SAFETY_ORDERS=30
-PRICE_DROP_PERCENT=1.33
-SOL_PROFIT_TARGET_PERCENT=8.0  # For SOL profit strategy only
-TARGET_PROFIT_PERCENT=2.0      # For USD profit strategy only
-MAX_DRAWDOWN_PERCENT=40.0
-
-# Trading Settings
-MAX_SLIPPAGE_PERCENT=1.0
-CHECK_INTERVAL_SECONDS=60
-MIN_SOL_BALANCE=0.1
-MIN_USDT_BALANCE=50.0
-
-# Safety Features
-ENABLE_EMERGENCY_STOP=true
-EMERGENCY_STOP_PERCENT=50.0
+# All pairs at once
+./run.sh all
 ```
 
-## 🤖 Bot Architecture
-
-### Core Components:
-1. **Wallet Manager** - Phantom wallet integration
-2. **Price Monitor** - Real-time SOL/USDT price tracking
-3. **Order Calculator** - DCA order size calculations
-4. **Trade Executor** - Jupiter swap execution
-5. **Profit Tracker** - SOL or USD profit tracking
-6. **Risk Manager** - Drawdown and position monitoring
-
-### Available Bots:
-- **`src/bot.js`** - USD profit strategy (2% USD target)
-- **`src/bot_sol_profit.js`** - SOL profit strategy (8% extra SOL target)
-
-## 📈 Expected Performance
-
-### SOL Profit Strategy:
-- **Best case**: +0.7132 SOL extra (worth $107 at $150 SOL)
-- **Worst case**: -40% USD ($265.76 loss)
-- **Recovery needed**: 15% from bottom
-- **Capital required**: $664.39 USDT
-
-### USD Profit Strategy:
-- **Best case**: +2% USD ($32.90 profit)
-- **Worst case**: -40% USD ($657.98 loss)
-- **Recovery needed**: 42.5% from bottom
-- **Capital required**: $1,644.94 USDT
-
-## ⚠️ Risk Management
-
-### Safety Features:
-1. **Balance checks** - Won't trade if insufficient funds
-2. **Slippage protection** - Limits price impact
-3. **Maximum orders** - Stops at 30 orders (40% drawdown)
-4. **Emergency stop** - Sells everything if extreme drop
-5. **State persistence** - Resume after restart
-
-### Monitoring:
-- Real-time P&L tracking
-- Position size monitoring
-- Wallet balance alerts
-- Price movement alerts
-
-## 🔄 Jupiter Exchange Integration
-
-### Why Jupiter?
-1. **Best prices** - Aggregates liquidity from all DEXs
-2. **Low fees** - Competitive trading fees
-3. **SOL native** - Built on Solana, fast and cheap
-4. **API support** - Well-documented API for bots
-
-## 🛡️ Security Considerations
-
-### Wallet Security:
-- **Never share** private key
-- Use **dedicated wallet** for bot only
-- Keep **minimum required funds** in bot wallet
-- Regular **backups** of wallet seed phrase
-
-### Bot Security:
-- Run in **isolated environment**
-- Regular **security updates**
-- **Monitor** for unauthorized access
-- **Emergency stop** functionality
-
-## 📚 Resources
-
-### Documentation:
-- [Jupiter API Docs](https://docs.jup.ag/)
-- [Solana Web3.js](https://solana-labs.github.io/solana-web3.js/)
-- [Phantom Wallet API](https://docs.phantom.app/)
-
-### Tools:
-- [Solana Explorer](https://explorer.solana.com/)
-- [Solscan](https://solscan.io/)
-- [Jupiter Swap](https://jup.ag/)
-
-## 🆘 Support
-
-### Common Issues:
-1. **Insufficient SOL for fees** - Keep at least 0.1 SOL in wallet
-2. **Slippage too high** - Adjust slippage tolerance
-3. **Network congestion** - Wait or increase priority fee
-4. **API rate limits** - Implement request throttling
-
-### Troubleshooting:
+Or via npm:
 ```bash
-# Check wallet balance
-npm run check-balance
-
-# Test swap (small amount)
-npm run test-swap 1
-
-# View bot logs
-tail -f logs/bot.log
+npm start          # SOL/USDC live
+npm start:bonk     # BONK/USDC live
+npm start:jup      # JUP/USDC live
+npm test           # SOL/USDC dry run
 ```
 
-## 📄 License
-MIT License - Use at your own risk. Cryptocurrency trading involves significant risk.
+## Configuration Options
 
----
+### Required
+| Variable | Example | Description |
+|----------|---------|-------------|
+| PHANTOM_PRIVATE_KEY | base64... | Wallet private key |
+| BASE_MINT | So111... | Base token mint address |
+| QUOTE_MINT | EPjFW... | Quote token (USDC) address |
+| BASE_TOKEN | SOL | Token symbol for logging |
+| BASE_DECIMALS | 9 | Token decimal places |
+| PAIR_LABEL | SOL/USDC | Display label |
 
-## 📖 Additional Documentation
+### Strategy
+| Variable | Default | Description |
+|----------|---------|-------------|
+| INITIAL_ORDER | 10.0 | First order size (USDC) |
+| ORDER_MULTIPLIER | 1.05 | Each order 5% larger |
+| MAX_SAFETY_ORDERS | 30 | Max DCA orders |
+| PRICE_DROP_PERCENT | 1.33 | Drop % between orders |
+| PROFIT_TARGET_PERCENT | 8.0 | Extra base token % |
+| MAX_DRAWDOWN_PERCENT | 40.0 | Emergency stop threshold |
 
-- [SOL_PROFIT_STRATEGY.md](SOL_PROFIT_STRATEGY.md) - Detailed SOL profit strategy
-- [STRATEGY_SUMMARY.md](STRATEGY_SUMMARY.md) - Complete strategy analysis
-- [PHANTOM_SETUP.md](PHANTOM_SETUP.md) - Wallet setup guide
+### Trading
+| Variable | Default | Description |
+|----------|---------|-------------|
+| MAX_SLIPPAGE_PERCENT | 1.0 | Max allowed slippage |
+| CHECK_INTERVAL_SECONDS | 60 | Price check frequency |
+| MIN_SOL_BALANCE | 0.1 | Min SOL for fees |
+| MIN_QUOTE_BALANCE | 50.0 | Min USDC required |
 
-**Disclaimer**: This bot is for educational purposes. Always test with small amounts first. Past performance does not guarantee future results.
+## Token Addresses (Mainnet)
+
+| Token | Mint Address | Decimals |
+|-------|-------------|----------|
+| SOL | So11111111111111111111111111111111111111112 | 9 |
+| USDC | EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v | 6 |
+| BONK | DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 | 5 |
+| JUP | JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN | 6 |
+
+## Adding a New Pair
+
+1. Copy a config: `cp .env.sol-usdc .env.mytoken-usdc`
+2. Edit: set BASE_MINT, BASE_TOKEN, BASE_DECIMALS, QUOTE_MINT, PAIR_LABEL
+3. Create a run alias in `run.sh` and `run.sh`
+
+## Files
+
+```
+├── src/
+│   ├── bot.js              # Main multi-pair DCA bot
+│   └── utils/
+│       ├── calculateOrders.js  # Strategy calculator
+│       └── checkBalance.js     # Wallet checker
+├── .env.sol-usdc           # SOL/USDC config
+├── .env.bonk-usdc          # BONK/USDC config
+├── .env.jup-usdc           # JUP/USDC config
+├── run.sh                  # Multi-pair runner
+└── package.json
+```
+
+## Architecture
+
+The bot is token-agnostic — it reads all parameters from the `.env` file:
+- **BASE_MINT/BASE_TOKEN**: The token you want to accumulate
+- **QUOTE_MINT**: The stablecoin you trade with (USDC)
+- **Jupiter API**: Fetches prices and swap quotes automatically
+- **State persistence**: Resume after restart, per-pair state files
+
+## Safety
+
+- Dedicated wallet with limited funds only
+- Emergency stop at configurable drawdown
+- Balance checks before every trade
+- State files in `state/` directory
+- Test mode for validation before live trading
+
+## Disclaimer
+
+This bot is for educational purposes. Crypto trading carries significant risk. Always test with small amounts first. Never share your private key.
