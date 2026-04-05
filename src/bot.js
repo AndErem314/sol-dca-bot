@@ -4,6 +4,11 @@
  * Solana DCA Trading Bot - Multi-Pair Support
  * Supports: SOL/USDC, BONK/USDC, JUP/USDC, and more
  * Strategy: Earn extra base token through pyramiding DCA
+ *
+ * Key improvements:
+ * - Catch-up: if price drops past multiple levels, places ALL missed orders
+ * - Exit readiness: tracks exit price precisely and sells immediately on recovery
+ * - Volatility-aware polling: speeds up during high price movement
  */
 
 require('dotenv').config();
@@ -12,120 +17,183 @@ const winston = require('winston');
 const fs = require('fs').promises;
 const path = require('path');
 
-// Configure logging
+// ===================== Configuration =====================
 const PAIR = process.env.PAIR_LABEL || 'SOL/USDC';
 const BASE_TOKEN = process.env.BASE_TOKEN || 'SOL';
+const INITIAL_ORDER = parseFloat(process.env.INITIAL_ORDER || 10.0);
+const ORDER_MULTIPLIER = parseFloat(process.env.ORDER_MULTIPLIER || 1.05);
+const MAX_ORDERS = parseInt(process.env.MAX_SAFETY_ORDERS || 30);
+const PRICE_DROP_PERCENT = parseFloat(process.env.PRICE_DROP_PERCENT || 1.33);
+const PROFIT_TARGET_PERCENT = parseFloat(process.env.PROFIT_TARGET_PERCENT || 8.0);
+const MAX_DRAWDOWN = parseFloat(process.env.MAX_DRAWDOWN_PERCENT || 40.0);
+const ENABLE_EMERGENCY_STOP = process.env.ENABLE_EMERGENCY_STOP === 'true';
+const EMERGENCY_STOP_PCT = parseFloat(process.env.EMERGENCY_STOP_PERCENT || 50.0);
+const MIN_CHECK_MS = Math.max(parseInt(process.env.MIN_CHECK_INTERVAL_MS || 5000), 1000);
+const MAX_CHECK_MS = parseInt(process.env.MAX_CHECK_INTERVAL_MS || 120000);
+const MAX_ORDERS_PER_CYCLE = parseInt(process.env.MAX_ORDERS_PER_CYCLE || 5);
 
+// ===================== Logging =====================
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) => {
-      return `${timestamp} [${PAIR}] [${level.toUpperCase()}]: ${message}`;
-    })
+    winston.format.printf(({ timestamp, level, message }) =>
+      `${timestamp} [${PAIR}] [${level.toUpperCase()}]: ${message}`
+    )
   ),
   transports: [
     new winston.transports.Console(),
     ...(process.env.LOG_TO_FILE === 'true' ? [
-      new winston.transports.File({ 
-        filename: `logs/${PAIR.replace('/', '-')}-bot.log` 
-      })
+      new winston.transports.File({ filename: `logs/${PAIR.replace('/', '-')}-bot.log` })
     ] : [])
   ]
 });
 
 // ===================== Trading State =====================
+
+/**
+ * Pre-computes all DCA grid levels: order size, trigger price, cumulative totals.
+ * Trigger prices are relative to entry price (set once first order executes).
+ */
+function buildOrderGrid() {
+  const levels = [];
+  let cumulativeUSDC = 0;
+
+  for (let i = 0; i < MAX_ORDERS; i++) {
+    const orderNum = i + 1;
+    const orderSize = INITIAL_ORDER * Math.pow(ORDER_MULTIPLIER, i);
+    const priceDropPct = i * PRICE_DROP_PERCENT;
+    cumulativeUSDC += orderSize;
+
+    levels.push({
+      orderNum,
+      orderIndex: i,
+      orderSize,
+      cumulativeUSDC,
+      priceDropPct,
+      // multiplier for trigger price: 1 - drop%/100
+      priceMultiplier: 1 - priceDropPct / 100,
+      filled: false,
+      fillPrice: null,
+      fillTimestamp: null,
+    });
+  }
+
+  return levels;
+}
+
 class TradingState {
   constructor() {
-    this.entryPrice = null;
-    this.currentOrder = 0;
-    this.ordersPlaced = [];
-    this.totalInvestedQuote = 0;    // Total quote token invested (USDC)
-    this.totalBaseBought = 0;       // Total base token accumulated (SOL, BONK, JUP)
+    this.entryPrice = null;        // Set after first order
+    this.grid = buildOrderGrid();
+    this.totalInvestedQuote = 0;
+    this.totalBaseBought = 0;
     this.averageEntryPrice = null;
     this.isRunning = false;
     this.emergencyStop = false;
-    this.profitTargetPercent = parseFloat(process.env.PROFIT_TARGET_PERCENT || 8.0);
     this.targetExtraBase = 0;
     this.targetTotalBase = 0;
   }
 
-  addOrder(price, amountQuote, amountBase) {
-    this.ordersPlaced.push({
-      order: this.currentOrder + 1,
-      price,
-      amountQuote,
-      amountBase,
-      timestamp: Date.now()
-    });
+  get filledCount() {
+    return this.grid.filter(l => l.filled).length;
+  }
 
-    this.totalInvestedQuote += amountQuote;
-    this.totalBaseBought += amountBase;
+  get currentOrderIndex() {
+    return this.filledCount;  // 0-based index of next order to fill
+  }
+
+  /**
+   * Add a filled order to state.
+   * For the first order, sets entryPrice and calculates trigger prices.
+   */
+  addOrder(level, actualPrice, actualBaseAmount) {
+    level.filled = true;
+    level.fillPrice = actualPrice;
+    level.fillTimestamp = Date.now();
+
+    // First order sets entry price and propagates trigger prices to all levels
+    if (this.entryPrice === null) {
+      this.entryPrice = actualPrice;
+      for (const l of this.grid) {
+        l.triggerPrice = actualPrice * l.priceMultiplier;
+      }
+    }
+
+    this.totalInvestedQuote += level.orderSize;
+    this.totalBaseBought += actualBaseAmount;
     this.averageEntryPrice = this.totalInvestedQuote / this.totalBaseBought;
-    this.currentOrder++;
 
-    this.targetExtraBase = this.totalBaseBought * (this.profitTargetPercent / 100);
+    // Calculate target
+    this.targetExtraBase = this.totalBaseBought * (PROFIT_TARGET_PERCENT / 100);
     this.targetTotalBase = this.totalBaseBought + this.targetExtraBase;
 
-    const baseToken = BASE_TOKEN;
+    const exitPrice = this.getExitPrice();
     logger.info(
-      `Order #${this.currentOrder}: $${amountQuote.toFixed(2)} USDC → ${amountBase.toFixed(4)} ${baseToken} @ $${price.toFixed(6)}`
+      `[ORDER #${level.orderNum}] ${actualBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${actualPrice.toFixed(6)} ($${level.orderSize.toFixed(2)} USDC)`
     );
     logger.info(
-      `Total: $${this.totalInvestedQuote.toFixed(2)} invested, ${this.totalBaseBought.toFixed(4)} ${baseToken}`
+      `[SUMMARY] Filled: ${this.filledCount}/${MAX_ORDERS} | Invested: $${this.totalInvestedQuote.toFixed(2)} | ${this.totalBaseBought.toFixed(6)} ${BASE_TOKEN} | Avg: $${this.averageEntryPrice.toFixed(6)}`
     );
     logger.info(
-      `Target: +${this.profitTargetPercent}% ${baseToken} = ${this.targetExtraBase.toFixed(4)} extra`
+      `[EXIT] Target: ${this.targetExtraBase.toFixed(6)} extra ${BASE_TOKEN} (+${PROFIT_TARGET_PERCENT}%) | Exit price: $${exitPrice.toFixed(6)}`
     );
   }
 
-  shouldPlaceOrder(currentPrice) {
-    if (this.emergencyStop) return false;
-    if (this.currentOrder >= parseInt(process.env.MAX_SAFETY_ORDERS || 30)) return false;
-
-    if (!this.entryPrice) {
-      this.entryPrice = currentPrice;
-      return true;
-    }
-
-    const priceDropPct = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
-    const triggerLevel = this.currentOrder * parseFloat(process.env.PRICE_DROP_PERCENT || 1.33);
-
-    return priceDropPct >= triggerLevel;
+  /**
+   * The price at which we should sell to get our USDC back + extra base token.
+   * exit_price = total_invested_USDC / (total_base + extra_base)
+   * If price >= exit_price, we sold at break-even USDC but kept +extra_base tokens.
+   */
+  getExitPrice() {
+    if (this.targetTotalBase === 0) return null;
+    return this.totalInvestedQuote / this.targetTotalBase;
   }
 
-  calculateOrderSize() {
-    const initial = parseFloat(process.env.INITIAL_ORDER || 10.0);
-    const multiplier = parseFloat(process.env.ORDER_MULTIPLIER || 1.05);
-    return initial * Math.pow(multiplier, this.currentOrder);
-  }
-
+  /**
+   * Check if price is at or above exit target — ready to sell.
+   */
   shouldExit(currentPrice) {
-    if (!this.averageEntryPrice || this.totalBaseBought === 0) return false;
+    const exitPrice = this.getExitPrice();
+    if (!exitPrice || this.totalBaseBought === 0) return false;
 
-    const targetExitPrice = this.totalInvestedQuote / this.targetTotalBase;
-
-    if (currentPrice >= targetExitPrice) {
-      logger.info(`${BASE_TOKEN} profit target reached! Price: $${currentPrice.toFixed(6)} >= Target: $${targetExitPrice.toFixed(6)}`);
+    if (currentPrice >= exitPrice) {
+      logger.info(
+        `[EXIT] Profit target reached! Price $${currentPrice.toFixed(6)} >= Target $${exitPrice.toFixed(6)}`
+      );
       return true;
     }
 
-    if (process.env.ENABLE_EMERGENCY_STOP === 'true') {
-      const maxDD = parseFloat(process.env.MAX_DRAWDOWN_PERCENT || 40.0);
-      const drawdown = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
-      if (drawdown > maxDD) {
-        logger.warn(`Emergency stop: ${drawdown.toFixed(1)}% drawdown`);
+    if (ENABLE_EMERGENCY_STOP) {
+      const dropPct = ((this.entryPrice - currentPrice) / this.entryPrice) * 100;
+      if (dropPct > EMERGENCY_STOP_PCT) {
+        logger.error(
+          `[EMERGENCY] Drawdown ${dropPct.toFixed(1)}% exceeds ${EMERGENCY_STOP_PCT}% limit!`
+        );
         this.emergencyStop = true;
-        return true;
+        return true;  // Sell to stop losses
       }
     }
 
     return false;
   }
 
-  getExitPriceForTarget() {
-    if (this.targetTotalBase === 0) return null;
-    return this.totalInvestedQuote / this.targetTotalBase;
+  /**
+   * Find all grid levels whose trigger price has been reached by current price.
+   * Returns levels that are NOT yet filled and whose triggerPrice >= currentPrice.
+   * Sorted from oldest (lowest index) to newest.
+   */
+  getTriggeredLevels(currentPrice) {
+    const triggered = [];
+    for (const level of this.grid) {
+      if (level.filled) continue;
+      if (level.triggerPrice === undefined) continue;  // entry not set yet
+
+      if (currentPrice <= level.triggerPrice) {
+        triggered.push(level);
+      }
+    }
+    return triggered;
   }
 }
 
@@ -137,15 +205,21 @@ class DCABot {
     this.state = new TradingState();
     this.isTestMode = process.argv.includes('--test');
 
-    // Token mint addresses
     this.baseMint = new PublicKey(process.env.BASE_MINT);
     this.quoteMint = new PublicKey(process.env.QUOTE_MINT);
-    this.baseDecimals = parseInt(process.env.BASE_DECIMALS || 9);  // SOL=9, BONK=5, JUP=6
-    this.quoteDecimals = parseInt(process.env.QUOTE_DECIMALS || 6); // USDC=6
+    this.baseDecimals = parseInt(process.env.BASE_DECIMALS || 9);
+    this.quoteDecimals = parseInt(process.env.QUOTE_DECIMALS || 6);
+
+    // Volatility tracking for adaptive polling
+    this.priceHistory = [];
+    this.volatilityCheckMs = 0;  // When last volatility check ran
   }
 
   async initialize() {
     logger.info(`Initializing ${PAIR} DCA Bot...`);
+    logger.info(`  Mode: ${this.isTestMode ? 'TEST (dry run)' : 'LIVE'}`);
+    logger.info(`  Strategy: $${INITIAL_ORDER} initial, ${ORDER_MULTIPLIER}x multiplier, ${MAX_ORDERS} orders`);
+    logger.info(`  Trigger: ${PRICE_DROP_PERCENT}% per level, +${PROFIT_TARGET_PERCENT}% ${BASE_TOKEN} target`);
 
     this.connection = new Connection(
       process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
@@ -158,19 +232,20 @@ class DCABot {
     }
 
     this.wallet = Keypair.fromSecretKey(Buffer.from(privateKey, 'base64'));
-    logger.info(`Wallet: ${this.wallet.publicKey.toString()}`);
+    logger.info(`  Wallet: ${this.wallet.publicKey.toString()}`);
+    logger.info(`  Base mint: ${this.baseMint.toString()} (${BASE_TOKEN}, ${this.baseDecimals} decimals)`);
+    logger.info(`  Quote mint: ${this.quoteMint.toString()} (${PAIR.split('/')[1]}, ${this.quoteDecimals} decimals)`);
 
     await this.checkBalances();
-    logger.info(`${PAIR} Bot initialized — Test mode: ${this.isTestMode}`);
+
     this.state.isRunning = true;
   }
 
   async checkBalances() {
     try {
       const solBalance = await this.connection.getBalance(this.wallet.publicKey);
-      logger.info(`SOL balance: ${(solBalance / 1e9).toFixed(4)} SOL`);
+      logger.info(`  SOL balance: ${(solBalance / 1e9).toFixed(6)} SOL`);
 
-      // Check quote token balance
       const tokenAccounts = await this.connection.getTokenAccountsByOwner(
         this.wallet.publicKey,
         { mint: this.quoteMint }
@@ -178,30 +253,19 @@ class DCABot {
 
       if (tokenAccounts.value.length > 0) {
         const balance = await this.connection.getTokenAccountBalance(tokenAccounts.value[0].pubkey);
-        const quoteBalance = balance.value.uiAmount || 0;
-        logger.info(`Quote balance: ${quoteBalance.toFixed(2)} (USDC)`);
-
-        const minQuote = parseFloat(process.env.MIN_QUOTE_BALANCE || 50.0);
-        if (quoteBalance < minQuote) {
-          logger.warn(`Low quote balance: ${quoteBalance.toFixed(2)} < $${minQuote}`);
-        }
+        const quoteBal = balance.value.uiAmount || 0;
+        logger.info(`  ${PAIR.split('/')[1]} balance: ${quoteBal.toFixed(2)}`);
       } else {
-        logger.warn(`No ${PAIR.split('/')[1]} token account found`);
+        logger.warn(`  No ${PAIR.split('/')[1]} token account found`);
       }
     } catch (error) {
-      logger.error(`Balance check failed: ${error.message}`);
+      logger.error(`  Balance check failed: ${error.message}`);
     }
   }
 
-  /**
-   * Get current price: how much quote token (USDC) per 1 base token.
-   * Uses Jupiter quote API.
-   */
   async getPrice() {
     try {
-      // Ask Jupiter: "1 base token = how much USDC?"
-      const baseAmount = Math.pow(10, this.baseDecimals); // 1 full base token
-
+      const baseAmount = Math.pow(10, this.baseDecimals);
       const params = new URLSearchParams({
         inputMint: this.baseMint.toString(),
         outputMint: this.quoteMint.toString(),
@@ -209,19 +273,12 @@ class DCABot {
         slippageBps: '50',
       });
 
-      const response = await fetch(
-        `https://quote-api.jup.ag/v6/quote?${params}`
-      );
+      const resp = await fetch(`https://quote-api.jup.ag/v6/quote?${params}`);
+      if (!resp.ok) throw new Error(`Jupiter API: ${resp.status} ${resp.statusText}`);
 
-      if (!response.ok) {
-        throw new Error(`Jupiter API error: ${response.status}`);
-      }
-
-      const data = await response.json();
+      const data = await resp.json();
       const quoteAmount = parseInt(data.outAmount);
-      const price = quoteAmount / Math.pow(10, this.quoteDecimals);
-
-      return price;
+      return quoteAmount / Math.pow(10, this.quoteDecimals);
     } catch (error) {
       logger.error(`Price fetch failed: ${error.message}`);
       return null;
@@ -229,14 +286,39 @@ class DCABot {
   }
 
   /**
-   * Execute a buy order: swap quote token (USDC) for base token (SOL, BONK, JUP)
+   * Calculate adaptive sleep time based on recent price volatility.
+   * During high volatility → fast checks (5-10s).
+   * During calm periods → slow checks (60-120s).
+   * Always check at least every MAX_CHECK_MS.
    */
-  async executeBuyOrder(amountQuote) {
+  getDynamicInterval(currentPrice) {
+    // Store price for volatility calculation
+    this.priceHistory.push({ price: currentPrice, time: Date.now() });
+    // Keep last 5 minutes of data
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    this.priceHistory = this.priceHistory.filter(p => p.time > cutoff);
+
+    if (this.priceHistory.length >= 3) {
+      const recent = this.priceHistory.slice(-10);
+      const prices = recent.map(p => p.price);
+      const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+      const volatility = prices.reduce((sum, p) => sum + Math.abs(p - avg), 0) / (avg * prices.length);
+
+      // High vol (>2%): 5s, Medium (>1%): 15s, Low (<0.5%): 60s+
+      if (volatility > 0.02) return Math.max(MIN_CHECK_MS, 5000);
+      if (volatility > 0.01) return Math.max(MIN_CHECK_MS, 15000);
+      if (volatility > 0.005) return 30000;
+      return Math.min(MAX_CHECK_MS, 120000);
+    }
+
+    // Not enough data yet, use moderate interval
+    return 15000;
+  }
+
+  async executeBuyOrder(amountQuote, baseToken) {
     if (this.isTestMode) {
       const mockPrice = 100.0;
-      const mockBase = amountQuote / mockPrice;
-      logger.info(`[TEST] Buy: $${amountQuote.toFixed(2)} USDC → ${mockBase.toFixed(4)} ${BASE_TOKEN}`);
-      return { success: true, amountBase: mockBase };
+      return { success: true, amountBase: amountQuote / mockPrice, mockPrice };
     }
 
     try {
@@ -250,10 +332,7 @@ class DCABot {
         slippageBps: slippageBps.toString(),
       });
 
-      const quoteResp = await fetch(
-        `https://quote-api.jup.ag/v6/quote?${params}`
-      );
-
+      const quoteResp = await fetch(`https://quote-api.jup.ag/v6/quote?${params}`);
       if (!quoteResp.ok) throw new Error(`Quote failed: ${quoteResp.status}`);
       const quoteData = await quoteResp.json();
 
@@ -261,33 +340,32 @@ class DCABot {
         throw new Error('No route found');
       }
 
-      // For a full implementation, you would:
-      // 1. POST to /swap to get the swap transaction
-      // 2. Sign with wallet
-      // 3. Send to network
-      // For now, we return the quote data
-
       const baseAmount = parseInt(quoteData.outAmount);
       const amountBase = baseAmount / Math.pow(10, this.baseDecimals);
+      const effectivePrice = amountQuote / amountBase;
 
-      logger.info(`Quote: $${amountQuote.toFixed(2)} USDC → ${amountBase.toFixed(4)} ${BASE_TOKEN}`);
+      logger.info(
+        `[QUOTE] $${amountQuote.toFixed(2)} → ${amountBase.toFixed(6)} ${BASE_TOKEN} (eff. price: $${effectivePrice.toFixed(6)})`
+      );
+
+      // TODO: Execute actual Jupiter swap here (POST /swap, sign, send)
+      // For now: log the result. In live mode, uncomment swap execution.
 
       return { success: true, amountBase, quoteData };
     } catch (error) {
-      logger.error(`Buy order failed: ${error.message}`);
+      logger.error(`Buy failed: ${error.message}`);
       return { success: false, error: error.message };
     }
   }
 
-  /**
-   * Execute sell: swap all base token back to quote token
-   */
   async executeSellAll() {
     if (this.isTestMode) {
-      const mockPrice = await this.getPrice() || 100.0;
-      const totalValue = this.state.totalBaseBought * mockPrice;
-      logger.info(`[TEST] Sell: ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN} → $${totalValue.toFixed(2)} USDC`);
-      return { success: true, amountQuote: totalValue };
+      const currentPrice = await this.getPrice() || 100.0;
+      return {
+        success: true,
+        amountQuote: this.state.totalBaseBought * currentPrice,
+        profit: (this.state.totalBaseBought * currentPrice) - this.state.totalInvestedQuote,
+      };
     }
 
     try {
@@ -301,26 +379,20 @@ class DCABot {
         slippageBps: slippageBps.toString(),
       });
 
-      const quoteResp = await fetch(
-        `https://quote-api.jup.ag/v6/quote?${params}`
-      );
-
+      const quoteResp = await fetch(`https://quote-api.jup.ag/v6/quote?${params}`);
       if (!quoteResp.ok) throw new Error(`Sell quote failed: ${quoteResp.status}`);
       const quoteData = await quoteResp.json();
 
       const quoteAmount = parseInt(quoteData.outAmount);
       const amountQuote = quoteAmount / Math.pow(10, this.quoteDecimals);
-
-      logger.info(`Sell quote: ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN} → $${amountQuote.toFixed(2)} USDC`);
-
       const profit = amountQuote - this.state.totalInvestedQuote;
-      const profitPct = (profit / this.state.totalInvestedQuote) * 100;
-      const extraBaseValue = this.state.targetExtraBase * (amountQuote / this.state.totalBaseBought);
 
-      logger.info(`Profit: $${profit.toFixed(2)} (${profitPct.toFixed(2)}%)`);
-      logger.info(`Extra ${BASE_TOKEN}: ${this.state.targetExtraBase.toFixed(4)} worth $${extraBaseValue.toFixed(2)}`);
+      logger.info(
+        `[SELL] ${this.state.totalBaseBought.toFixed(6)} ${BASE_TOKEN} → $${amountQuote.toFixed(2)} USDC (profit: $${profit.toFixed(2)})`
+      );
 
-      return { success: true, amountQuote, profit, extraBaseValue };
+      // TODO: Execute actual Jupiter swap
+      return { success: true, amountQuote, profit };
     } catch (error) {
       logger.error(`Sell failed: ${error.message}`);
       return { success: false, error: error.message };
@@ -333,19 +405,26 @@ class DCABot {
       await fs.mkdir(stateDir, { recursive: true });
 
       const stateFile = path.join(stateDir, `${PAIR.replace('/', '-')}-state.json`);
-      const stateData = {
+
+      // Serialize grid with fill status
+      const gridData = this.state.grid.map(l => ({
+        ...l,
+        // Don't serialize undefined triggerPrice (before entry)
+        triggerPrice: l.triggerPrice ?? null,
+      }));
+
+      await fs.writeFile(stateFile, JSON.stringify({
         entryPrice: this.state.entryPrice,
-        currentOrder: this.state.currentOrder,
-        ordersPlaced: this.state.ordersPlaced,
         totalInvestedQuote: this.state.totalInvestedQuote,
         totalBaseBought: this.state.totalBaseBought,
         averageEntryPrice: this.state.averageEntryPrice,
         targetExtraBase: this.state.targetExtraBase,
         targetTotalBase: this.state.targetTotalBase,
-        lastUpdated: Date.now()
-      };
+        emergencyStop: this.state.emergencyStop,
+        grid: gridData,
+        lastUpdated: Date.now(),
+      }, null, 2));
 
-      await fs.writeFile(stateFile, JSON.stringify(stateData, null, 2));
       logger.debug('State saved');
     } catch (error) {
       logger.error(`Save state failed: ${error.message}`);
@@ -354,95 +433,162 @@ class DCABot {
 
   async loadState() {
     try {
-      const stateFile = path.join(__dirname, '../state', `${PAIR.replace('/', '-')}-state.json`);
+      const stateFile = path.join(dirname, '../state', `${PAIR.replace('/', '-')}-state.json`);
       const data = await fs.readFile(stateFile, 'utf8');
-      const sd = JSON.parse(data);
+      const saved = JSON.parse(data);
 
-      this.state.entryPrice = sd.entryPrice;
-      this.state.currentOrder = sd.currentOrder;
-      this.state.ordersPlaced = sd.ordersPlaced || [];
-      this.state.totalInvestedQuote = sd.totalInvestedQuote;
-      this.state.totalBaseBought = sd.totalBaseBought;
-      this.state.averageEntryPrice = sd.averageEntryPrice;
-      this.state.targetExtraBase = sd.targetExtraBase;
-      this.state.targetTotalBase = sd.targetTotalBase;
+      this.state.entryPrice = saved.entryPrice;
+      this.state.totalInvestedQuote = saved.totalInvestedQuote || 0;
+      this.state.totalBaseBought = saved.totalBaseBought || 0;
+      this.state.averageEntryPrice = saved.averageEntryPrice;
+      this.state.targetExtraBase = saved.targetExtraBase || 0;
+      this.state.targetTotalBase = saved.targetTotalBase || 0;
+      this.state.emergencyStop = saved.emergencyStop || false;
 
-      logger.info(`Loaded state: ${this.state.currentOrder} orders, $${this.state.totalInvestedQuote.toFixed(2)}, ${this.state.totalBaseBought.toFixed(4)} ${BASE_TOKEN}`);
+      if (saved.grid && Array.isArray(saved.grid)) {
+        for (let i = 0; i < Math.min(saved.grid.length, this.state.grid.length); i++) {
+          const savedLevel = saved.grid[i];
+          const currentLevel = this.state.grid[i];
+          currentLevel.filled = savedLevel.filled;
+          currentLevel.fillPrice = savedLevel.fillPrice;
+          currentLevel.fillTimestamp = savedLevel.fillTimestamp;
+          if (savedLevel.triggerPrice) {
+            currentLevel.triggerPrice = savedLevel.triggerPrice;
+          }
+        }
+        logger.info(`Loaded state: ${this.state.filledCount}/${MAX_ORDERS} orders filled`);
+      }
+
+      return true;
     } catch {
       logger.info('No previous state — starting fresh');
+      return false;
     }
+  }
+
+  /**
+   * Print the current grid status showing filled and pending orders.
+   */
+  printGrid(currentPrice) {
+    const exitPrice = this.state.getExitPrice();
+    const pctToExit = exitPrice
+      ? (((exitPrice - currentPrice) / currentPrice) * 100).toFixed(1)
+      : '—';
+
+    logger.info('═'.repeat(70));
+    logger.info(`${PAIR} STATUS — Price: $${currentPrice.toFixed(6)} | Entry: ${this.state.entryPrice ? '$' + this.state.entryPrice.toFixed(6) : 'N/A'}`);
+    logger.info(`Filled: ${this.state.filledCount}/${MAX_ORDERS} | Invested: $${this.state.totalInvestedQuote.toFixed(2)} | ${this.state.totalBaseBought.toFixed(6)} ${BASE_TOKEN}`);
+    logger.info(`Exit target: $${exitPrice?.toFixed(6) ?? 'N/A'} (${pctToExit}% to go) | +${this.state.targetExtraBase.toFixed(6)} extra ${BASE_TOKEN}`);
+    logger.info('─'.repeat(70));
+    logger.info(
+      '#'.padEnd(3) + ' ' +
+      'Size'.padStart(8) + ' ' +
+      'CumUSDC'.padStart(9) + ' ' +
+      'Drop%'.padStart(8) + ' ' +
+      'Trigger'.padStart(10) + ' ' +
+      'Status'.padStart(12)
+    );
+    logger.info('─'.repeat(70));
+
+    for (const level of this.state.grid) {
+      const filled = level.filled ? 'FILLED' : (level.triggerPrice ? 'PENDING' : 'WAITING ENTRY');
+      const triggerStr = level.triggerPrice ? `$${level.triggerPrice.toFixed(4)}` : '—';
+
+      // Highlight: filled orders, next order, future orders
+      const marker = level.filled ? '  ✓' : (level.triggerPrice && currentPrice <= level.triggerPrice ? '  ◆' : '   ');
+
+      logger.info(
+        `${level.orderNum.toString().padEnd(3)} ` +
+        `$${level.orderSize.toFixed(2)}`.padStart(8) + ' ' +
+        `$${level.cumulativeUSDC.toFixed(1)}`.padStart(9) + ' ' +
+        `${level.priceDropPct.toFixed(1)}%`.padStart(8) + ' ' +
+        triggerStr.padStart(10) + ' ' +
+        `${filled}${marker}`
+      );
+    }
+    logger.info('═'.repeat(70));
   }
 
   async run() {
     try {
       await this.initialize();
-      await this.loadState();
 
-      const checkInterval = parseInt(process.env.CHECK_INTERVAL_SECONDS || 60) * 1000;
+      const hadState = await this.loadState();
 
-      logger.info(`🚀 ${PAIR} DCA Bot running — ${BASE_TOKEN} profit target: ${this.state.profitTargetPercent}%`);
+      const price = await this.getPrice();
+      if (!price) {
+        logger.error('Cannot get initial price. Exiting.');
+        process.exit(1);
+      }
 
-      while (this.state.isRunning && !this.state.emergencyStop) {
+      // Print initial grid
+      this.printGrid(price);
+
+      // If loading state with existing filled orders, show status
+      if (hadState && this.state.entryPrice) {
+        logger.info(`Resumed position: ${this.state.filledCount} orders filled, ${this.state.totalBaseBought.toFixed(6)} ${BASE_TOKEN}`);
+
+        // Check for any missed orders (price may have dropped while we were offline)
+        const triggered = this.state.getTriggeredLevels(price);
+        if (triggered.length > 0) {
+          logger.info(`  ⚠ ${triggered.length} missed order(s) detected — executing catch-up...`);
+          await this.executeTriggeredOrders(triggered, price);
+        }
+
+        // Check if we can exit
+        if (this.state.shouldExit(price)) {
+          logger.info('  Exit condition met — selling now...');
+          await this.doExit();
+          return;
+        }
+      }
+
+      logger.info(`Starting main loop — checking every ${MIN_CHECK_MS / 1000}s (adapts to volatility)`);
+
+      while (!this.state.emergencyStop) {
         try {
           const currentPrice = await this.getPrice();
           if (!currentPrice) {
             logger.warn('Price fetch failed, waiting...');
-            await this.sleep(checkInterval);
+            await this.sleep(15000);
             continue;
           }
 
-          logger.debug(`${PAIR} price: $${currentPrice.toFixed(6)}`);
+          logger.debug(`Price: $${currentPrice.toFixed(6)}`);
 
-          // Place order if needed
-          if (this.state.shouldPlaceOrder(currentPrice)) {
-            const orderSize = this.state.calculateOrderSize();
-            const result = await this.executeBuyOrder(orderSize);
-
-            if (result.success) {
-              this.state.addOrder(currentPrice, orderSize, result.amountBase);
-              await this.saveState();
-
-              const targetPrice = this.state.getExitPriceForTarget();
-              if (targetPrice) {
-                const recovery = ((targetPrice / (this.state.entryPrice * 0.6)) - 1) * 100;
-                logger.info(`🎯 Exit target: $${targetPrice.toFixed(6)} (${recovery.toFixed(1)}% recovery from bottom)`);
-              }
-
-              await this.notify(
-                `Order #${this.state.currentOrder}: $${orderSize.toFixed(2)} → ${result.amountBase.toFixed(4)} ${BASE_TOKEN} @ $${currentPrice.toFixed(6)}`
-              );
-            }
-          }
-
-          // Check exit
+          // ─── EXIT CHECK ───
+          // Always check exit FIRST. If target hit, sell immediately.
           if (this.state.shouldExit(currentPrice)) {
-            logger.info('🎯 Profit target reached — selling all...');
-            const result = await this.executeSellAll();
-
-            if (result.success) {
-              await this.notify(
-                `✅ ${PAIR} sold!\nProfit: $${result.profit?.toFixed(2) || '0.00'}\nExtra ${BASE_TOKEN}: ${this.state.targetExtraBase.toFixed(4)}`
-              );
-              this.state.isRunning = false;
-              break;
-            }
+            await this.doExit();
+            return;
           }
 
-          // Periodic status
-          if (Date.now() % (10 * 60 * 1000) < checkInterval) {
-            const targetPrice = this.state.getExitPriceForTarget();
-            if (targetPrice) {
-              const pctToGo = ((targetPrice - currentPrice) / currentPrice) * 100;
-              logger.info(
-                `${PAIR}: $${currentPrice.toFixed(6)} → $${targetPrice.toFixed(6)} (${pctToGo.toFixed(1)}% to go) | ${this.state.currentOrder}/30 orders | $${this.state.totalInvestedQuote.toFixed(2)} invested`
-              );
-            }
+          // ─── CATCH-UP ORDERS ───
+          // Find all triggered levels that haven't been filled yet.
+          const triggered = this.state.getTriggeredLevels(currentPrice);
+
+          if (triggered.length > 0) {
+            // We have missed levels — execute them
+            const toExecute = triggered.slice(0, MAX_ORDERS_PER_CYCLE);
+            logger.info(`[CATCH-UP] ${triggered.length} order(s) triggered, executing ${toExecute.length} this cycle...`);
+            await this.executeTriggeredOrders(toExecute, currentPrice);
+
+            // After execution, print updated grid
+            this.printGrid(currentPrice);
           }
 
-          await this.sleep(checkInterval);
+          // ─── STATUS LOG ───
+          logger.info(
+            `[STATUS] $${currentPrice.toFixed(6)} → Exit $${this.state.getExitPrice()?.toFixed(6) ?? 'N/A'} | ${this.state.filledCount}/${MAX_ORDERS} orders | $${this.state.totalInvestedQuote.toFixed(2)} invested`
+          );
+
+          // ─── ADAPTIVE SLEEP ───
+          const sleepTime = this.getDynamicInterval(currentPrice);
+          await this.sleep(sleepTime);
+
         } catch (error) {
           logger.error(`Loop error: ${error.message}`);
-          await this.sleep(checkInterval);
+          await this.sleep(15000);
         }
       }
 
@@ -453,15 +599,84 @@ class DCABot {
     }
   }
 
+  /**
+   * Execute a batch of triggered orders.
+   * In high volatility, this handles multiple levels at once.
+   */
+  async executeTriggeredOrders(levels, currentPrice) {
+    for (const level of levels) {
+      if (level.filled) continue;  // safety check
+
+      const result = await this.executeBuyOrder(level.orderSize, BASE_TOKEN);
+
+      if (result.success) {
+        this.state.addOrder(level, currentPrice, result.amountBase);
+        await this.saveState();
+      } else {
+        logger.error(`Failed to execute order #${level.orderNum}: ${result.error}`);
+      }
+    }
+  }
+
+  /**
+   * Execute sell (take profit or emergency stop).
+   * Saves state and sends notification.
+   */
+  async doExit() {
+    const exitPrice = this.state.getExitPrice();
+    const reason = this.state.emergencyStop ? 'EMERGENCY STOP' : 'PROFIT TARGET';
+    logger.info(`[${reason}] Executing exit at $${(await this.getPrice())?.toFixed(6) ?? 'N/A'}...`);
+
+    const result = await this.executeSellAll();
+
+    if (result.success) {
+      await this.saveState();
+
+      const extraSolValue = this.state.targetExtraBase * (result.amountQuote / this.state.totalBaseBought);
+      await this.notify(
+        `[${reason}] ${PAIR} sold!\n` +
+        `Invested: $${this.state.totalInvestedQuote.toFixed(2)} USDC\n` +
+        `Received: $${result.amountQuote.toFixed(2)} USDC\n` +
+        `Profit: $${result.profit?.toFixed(2) || '0.00'}\n` +
+        `Extra ${BASE_TOKEN}: ${this.state.targetExtraBase.toFixed(6)} (worth ~$${extraSolValue.toFixed(2)})`
+      );
+
+      this.state.isRunning = false;
+      this.state.emergencyStop = false;
+    } else {
+      logger.error(`Exit failed: ${result.error}`);
+      await this.notify(`[ERROR] ${PAIR} exit failed: ${result.error}`);
+      // Don't set isRunning = false so it retries
+    }
+  }
+
   async sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async notify(message) {
-    logger.info(`[NOTIFY] ${message}`);
-    // Telegram integration placeholder
+    logger.info(`┌─ NOTIFICATION ─────────────────────────────────`);
+    for (const line of message.split('\n')) {
+      logger.info(`│ ${line}`);
+    }
+    logger.info('└─────────────────────────────────────────────');
+
+    // Telegram webhook
     if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
-      // Implement Telegram notification
+      try {
+        const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: process.env.TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: 'Monospace',
+          }),
+        });
+      } catch (err) {
+        logger.warn(`Telegram notification failed: ${err.message}`);
+      }
     }
   }
 }
@@ -470,13 +685,19 @@ class DCABot {
 let bot;
 process.on('SIGINT', async () => {
   logger.info('SIGINT — shutting down...');
-  if (bot && bot.state) bot.state.isRunning = false;
+  if (bot) {
+    bot.state.isRunning = false;
+    await bot.saveState();
+  }
   setTimeout(() => process.exit(0), 1000);
 });
 
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM — terminating...');
-  if (bot && bot.state) bot.state.isRunning = false;
+  if (bot) {
+    bot.state.isRunning = false;
+    await bot.saveState();
+  }
   setTimeout(() => process.exit(0), 1000);
 });
 
