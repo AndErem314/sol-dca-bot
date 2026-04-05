@@ -4,18 +4,13 @@
  * Solana DCA Trading Bot — Limit Order Edition
  *
  * Uses Jupiter Limit Order API so orders persist on-chain.
- * After placing a limit order, the bot tracks it and
- * automatically places the next order when it fills.
  *
  * Flow:
- *   1. Bot starts → checks for existing open limit orders
- *   2. If none → places first buy limit order at current price
- *   3. On fill → places next buy limit order at lower price
- *   4. Repeat until all orders filled
- *   5. When all filled (or anytime) → place sell limit order at exit price
- *   6. Sell fills → take profit, done
+ *   1. Place limit buy orders at grid levels
+ *   2. When all fills → place limit sell at exit price
+ *   3. Sell fills → keep extra base tokens as profit
  *
- * Orders survive bot restarts — they live on Jupiter's order book.
+ * Orders live on Jupiter → survive bot restarts.
  */
 
 require('dotenv').config();
@@ -37,9 +32,12 @@ const ENABLE_EMERGENCY_STOP = process.env.ENABLE_EMERGENCY_STOP === 'true';
 const EMERGENCY_STOP_PCT = parseFloat(process.env.EMERGENCY_STOP_PERCENT || 50.0);
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || 30000);
 
+// Telegram notifications
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
+
 // Jupiter API
-const JUPITER_API = 'https://jup.ag/api';
-const JUP_LIMIT_V4 = `${JUPITER_API}/limit/v4`;
+const JUPITER_LIMIT = 'https://jup.ag/api/limit/v4';
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -76,8 +74,7 @@ function buildGrid(entryPrice) {
       cumulativeUSDC: Math.round(cumulativeUSDC * 100) / 100,
       dropPercent: Math.round(dropPct * 100) / 100,
       limitPrice: Math.round(entryPrice * (1 - dropPct / 100) * 1e8) / 1e8,
-      // Jupiter limit order state
-      status: 'pending',   // pending | open | filled | cancelled
+      status: 'pending',
       orderId: null,
       filledPrice: null,
       filledAt: null,
@@ -105,11 +102,12 @@ class BotState {
     this.sellOrderId = null;
     this.sellFilled = false;
 
-    // Trading
     this.baseMint = null;
     this.quoteMint = null;
     this.baseDecimals = 9;
     this.quoteDecimals = 6;
+    this.connection = null;
+    this.wallet = null;
   }
 
   get filledCount() {
@@ -141,7 +139,6 @@ class BotState {
       `extra: +${this.targetExtraBase.toFixed(6)} ${BASE_TOKEN} (+${PROFIT_TARGET_PERCENT}%)`
     );
 
-    // Drawdown check
     if (ENABLE_EMERGENCY_STOP && this.entryPrice) {
       const dd = ((this.entryPrice - this.exitPrice) / this.entryPrice) * 100;
       if (dd > MAX_DRAWDOWN + 5) {
@@ -162,15 +159,6 @@ class JupiterLimits {
     this.connection = connection;
   }
 
-  /**
-   * Create a limit order.
-   *
-   * @param {string} inputMint  - Token you're selling
-   * @param {string} outputMint - Token you're buying
-   * @param {number} inAmount   - Amount of input tokens (raw, with decimals)
-   * @param {number} outAmount  - Minimum amount of output tokens (raw, with decimals)
-   * @returns {Promise<{success: boolean, orderId?: string, tx?: VersionedTransaction}>}
-   */
   async createOrder(inputMint, outputMint, inAmount, outAmount) {
     try {
       const body = {
@@ -184,73 +172,56 @@ class JupiterLimits {
 
       logger.debug(`[JUP LIMIT] POST /order — ${inAmount} → ${outAmount}`);
 
-      const resp = await fetch(`${JUP_LIMIT_V4}/order`, {
+      const resp = await fetch(`${JUPITER_LIMIT}/order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
 
       if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(`Jupiter API ${resp.status}: ${err}`);
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`Jupiter ${resp.status}: ${errText.slice(0, 200)}`);
       }
 
       const data = await resp.json();
       const orderId = data.orderId;
-
-      if (!orderId) {
-        throw new Error('No orderId in Jupiter response');
-      }
+      if (!orderId) throw new Error('No orderId in Jupiter response');
 
       if (data.tx) {
-        // If transaction is returned, we need to sign and send it.
-        // Base64-decode → deserialize → sign → send.
         const txBuf = Buffer.from(data.tx, 'base64');
         const tx = VersionedTransaction.deserialize(txBuf);
         tx.sign([this.wallet]);
-
         const txId = await this.connection.sendTransaction(tx, {
           skipPreflight: true,
           maxRetries: 2,
         });
-
-        logger.info(`[JUP LIMIT] Order ${orderId} submitted — tx: https://solscan.io/tx/${txId}`);
+        logger.info(`[JUP LIMIT] Order ${orderId} — tx: https://solscan.io/tx/${txId}`);
       } else {
-        logger.info(`[JUP LIMIT] Order created: ${orderId}`);
+        logger.info(`[JUP LIMIT] Order ${orderId} created`);
       }
 
       return { success: true, orderId };
     } catch (error) {
-      logger.error(`[JUP LIMIT] Create order failed: ${error.message}`);
+      logger.error(`[JUP LIMIT] Failed: ${error.message}`);
       return { success: false, error: error.message };
     }
   }
 
-  /**
-   * Get all open orders for a wallet.
-   */
   async getOpenOrders() {
     try {
       const resp = await fetch(
-        `${JUP_LIMIT_V4}/orders?wallet=${this.wallet.publicKey.toString()}&state=open`
+        `${JUPITER_LIMIT}/orders?wallet=${this.wallet.publicKey.toString()}&state=open`
       );
-      if (!resp.ok) {
-        logger.error(`[JUP LIMIT] Fetch orders failed: ${resp.status}`);
-        return [];
-      }
+      if (!resp.ok) return [];
       return await resp.json();
-    } catch (error) {
-      logger.error(`[JUP LIMIT] Fetch orders error: ${error.message}`);
+    } catch {
       return [];
     }
   }
 
-  /**
-   * Cancel an order.
-   */
   async cancelOrder(orderId) {
     try {
-      const resp = await fetch(`${JUP_LIMIT_V4}/order`, {
+      const resp = await fetch(`${JUPITER_LIMIT}/order`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -259,10 +230,42 @@ class JupiterLimits {
         }),
       });
       return resp.ok;
-    } catch (error) {
-      logger.error(`[JUP LIMIT] Cancel failed: ${error.message}`);
+    } catch {
       return false;
     }
+  }
+}
+
+// ─── Telegram Notifications ──────────────────────────────────────
+
+async function notify(message) {
+  const header = `🔔 [${PAIR}]`;
+  const fullMessage = `${header}\n${message}`;
+
+  logger.info(`📢 ${message.replace(/\n/g, '\n   ')}`);
+
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
+    return; // Telegram not configured — silently skip
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: fullMessage,
+        parse_mode: null, // plain text
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      logger.warn(`Telegram send failed: ${resp.status} ${body.slice(0, 200)}`);
+    }
+  } catch (err) {
+    logger.warn(`Telegram notification error: ${err.message}`);
   }
 }
 
@@ -281,27 +284,24 @@ class DCABot {
     logger.info(`  Quote: ${PAIR.split('/')[1]} (${process.env.QUOTE_MINT})`);
     logger.info(`  Grid: $${INITIAL_ORDER} × ${ORDER_MULTIPLIER}x, ${MAX_ORDERS} levels, ${PRICE_DROP_PERCENT}% spacing`);
 
-    // Tokens
     this.state.baseMint = new PublicKey(process.env.BASE_MINT);
     this.state.quoteMint = new PublicKey(process.env.QUOTE_MINT);
     this.state.baseDecimals = parseInt(process.env.BASE_DECIMALS || 9);
     this.state.quoteDecimals = parseInt(process.env.QUOTE_DECIMALS || 6);
 
-    // Connection
     const connection = new Connection(
       process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
       'confirmed'
     );
     this.state.connection = connection;
 
-    // Wallet
     const pk = process.env.PHANTOM_PRIVATE_KEY;
     if (!pk) throw new Error('PHANTOM_PRIVATE_KEY not set');
 
     const wallet = Keypair.fromSecretKey(Buffer.from(pk, 'base64'));
-    logger.info(`  Wallet: ${wallet.publicKey.toString()}`);
-
     this.state.wallet = wallet;
+
+    logger.info(`  Wallet: ${wallet.publicKey.toString()}`);
     this.jup = new JupiterLimits(wallet, connection);
 
     // Balances
@@ -310,10 +310,14 @@ class DCABot {
       logger.info(`  SOL: ${(solBal / 1e9).toFixed(4)}`);
     } catch {}
 
+    if (TG_BOT_TOKEN && TG_CHAT_ID) {
+      logger.info(`  Telegram: ${TG_CHAT_ID}`);
+    } else {
+      logger.info(`  Telegram: not configured`);
+    }
+
     logger.info(`Ready${this.isTestMode ? ' (TEST MODE)' : ''}`);
   }
-
-  // ─── Price ───────────────────────────────────────────────────
 
   async getPrice() {
     try {
@@ -337,9 +341,8 @@ class DCABot {
   async saveState() {
     const dir = path.join(process.cwd(), 'state');
     await fs.mkdir(dir, { recursive: true });
-
     const file = path.join(dir, `${PAIR.replace('/', '-')}.json`);
-    const data = {
+    await fs.writeFile(file, JSON.stringify({
       entryPrice: this.state.entryPrice,
       grid: this.state.grid,
       totalInvestedUSDC: this.state.totalInvestedUSDC,
@@ -351,9 +354,7 @@ class DCABot {
       sellOrderId: this.state.sellOrderId,
       sellFilled: this.state.sellFilled,
       savedAt: Date.now(),
-    };
-
-    await fs.writeFile(file, JSON.stringify(data, null, 2));
+    }, null, 2));
   }
 
   async loadState() {
@@ -361,10 +362,8 @@ class DCABot {
     try {
       const raw = await fs.readFile(file, 'utf8');
       const data = JSON.parse(raw);
-
       const ageMin = Math.round((Date.now() - data.savedAt) / 60000);
       logger.info(`Loaded state (saved ${ageMin}m ago)`);
-
       this.state.entryPrice = data.entryPrice;
       this.state.grid = data.grid;
       this.state.totalInvestedUSDC = data.totalInvestedUSDC || 0;
@@ -375,7 +374,6 @@ class DCABot {
       this.state.sellOrderPlaced = data.sellOrderPlaced;
       this.state.sellOrderId = data.sellOrderId;
       this.state.sellFilled = data.sellFilled;
-
       return true;
     } catch {
       return false;
@@ -384,14 +382,6 @@ class DCABot {
 
   // ─── Place Buy Limit Order ───────────────────────────────────
 
-  /**
-   * Place a limit order: sell USDC → buy BASE at limitPrice.
-   *
-   *   inAmount  = USDC amount (quote token, with decimals)
-   *   outAmount = minimum BASE we expect at limitPrice (base token, with decimals)
-   *
-   *   outAmount = floor(inAmount / limitPrice * 0.998)  // 0.2% buffer for dust/fees
-   */
   async placeBuyLimit(level) {
     if (this.isTestMode) {
       logger.info(`[TEST] Buy limit: $${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)}`);
@@ -402,8 +392,8 @@ class DCABot {
     const outAmount = Math.floor((level.sizeUSDC / level.limitPrice) * Math.pow(10, this.state.baseDecimals) * 0.998);
 
     logger.info(
-      `[BUY LIMIT] Order #${level.orderNum}: $${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)} ` +
-      `(→ ~${(outAmount / Math.pow(10, this.state.baseDecimals)).toFixed(6)} ${BASE_TOKEN})`
+      `[BUY LIMIT] #${level.orderNum}: $${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)} ` +
+      `(→ ${(outAmount / Math.pow(10, this.state.baseDecimals)).toFixed(6)} ${BASE_TOKEN})`
     );
 
     const result = await this.jup.createOrder(
@@ -418,7 +408,12 @@ class DCABot {
       level.orderId = result.orderId;
       await this.saveState();
 
-      logger.info(`[BUY LIMIT] ✓ Order #${level.orderNum} placed: ${result.orderId}`);
+      await notify(
+        `Buy limit #${level.orderNum} placed\n` +
+        `$${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)}\n` +
+        `Drop: ${level.dropPercent.toFixed(1)}% from entry\n` +
+        `Order: ${result.orderId}`
+      );
     }
 
     return result;
@@ -426,24 +421,13 @@ class DCABot {
 
   // ─── Place Sell Limit Order ──────────────────────────────────
 
-  /**
-   * Place a limit sell: sell all accumulated BASE → receive USDC at exitPrice.
-   * After fill we keep extra BASE (the profit) because the sell only sells
-   * the amount needed to recover totalInvestedUSDC.
-   *
-   * We sell: totalBaseBought × (exitPrice / avgEntryPrice) fraction
-   * Actually: we sell enough to get totalInvestedUSDC back at exitPrice.
-   *   sellBaseAmount = totalInvestedUSDC / exitPrice = targetTotalBase
-   *   keptBase = totalBaseBought - sellBaseAmount = targetExtraBase
-   */
   async placeSellLimit() {
     if (this.state.sellOrderPlaced || this.state.totalBaseBought === 0) return;
 
-    const sellBaseAmount = this.state.targetTotalBase !== 0
+    const sellBaseAmount = this.state.targetTotalBase > 0
       ? this.state.totalInvestedUSDC / this.state.exitPrice
       : this.state.totalBaseBought;
 
-    // If targetTotalBase < totalBaseBought, we keep the difference (the profit)
     const keepAmount = this.state.targetExtraBase;
 
     if (sellBaseAmount <= 0) {
@@ -462,8 +446,8 @@ class DCABot {
     const outAmount = Math.floor(this.state.totalInvestedUSDC * Math.pow(10, this.state.quoteDecimals));
 
     logger.info(
-      `[SELL LIMIT] ${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)} → $${this.state.totalInvestedUSDC.toFixed(2)} USDC ` +
-      `(keep ${keepAmount.toFixed(6)} extra ${BASE_TOKEN})`
+      `[SELL LIMIT] ${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)} ` +
+      `→ $${this.state.totalInvestedUSDC.toFixed(2)} USDC (keep ${keepAmount.toFixed(6)} extra ${BASE_TOKEN})`
     );
 
     const result = await this.jup.createOrder(
@@ -478,7 +462,13 @@ class DCABot {
       this.state.sellOrderPlaced = true;
       await this.saveState();
 
-      logger.info(`[SELL LIMIT] ✓ Sell placed: ${result.orderId}`);
+      await notify(
+        `Sell limit placed\n` +
+        `${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)}\n` +
+        `→ $${this.state.totalInvestedUSDC.toFixed(2)} USDC\n` +
+        `+${keepAmount.toFixed(6)} extra ${BASE_TOKEN} profit\n` +
+        `Order: ${result.orderId}`
+      );
     }
   }
 
@@ -489,7 +479,6 @@ class DCABot {
 
     const hadState = await this.loadState();
 
-    // If no state yet, get price and set up the grid
     if (!hadState || !this.state.entryPrice) {
       const price = await this.getPrice();
       if (!price) {
@@ -497,39 +486,40 @@ class DCABot {
         process.exit(1);
       }
 
-      logger.info(`Entry price: $${price.toFixed(6)}`);
       this.state.entryPrice = price;
       this.state.grid = buildGrid(price);
       await this.saveState();
+
+      await notify(
+        `Position opened\n` +
+        `Entry: $${price.toFixed(6)}\n` +
+        `Grid: ${MAX_ORDERS} levels, ${PRICE_DROP_PERCENT}% spacing\n` +
+        `$${INITIAL_ORDER} initial, ${ORDER_MULTIPLIER}x multiplier`
+      );
     }
 
-    // If we have state but no grid, rebuild it
     if (this.state.grid.length === 0) {
       this.state.grid = buildGrid(this.state.entryPrice);
     }
 
-    // ─── Reconcile with Jupiter open orders ───
+    // Reconcile with Jupiter open orders
     if (!this.isTestMode) {
       const openOrders = await this.jup.getOpenOrders();
       const orderMap = new Map(openOrders.map(o => [o.id, o]));
 
       for (const level of this.state.grid) {
         if (level.status === 'open' && level.orderId) {
-          const jupOrder = orderMap.get(level.orderId);
-          if (!jupOrder) {
-            // Order not on Jupiter anymore — might have filled
+          if (!orderMap.has(level.orderId)) {
             level.status = 'filled';
-            logger.info(`Order #${level.orderNum} (${level.orderId}) no longer on Jupiter — marked filled`);
+            logger.info(`Order #${level.orderNum} (${level.orderId}) gone from Jupiter → filled`);
           }
         }
       }
 
-      // Check if sell order is still open
       if (this.state.sellOrderId && this.state.sellOrderPlaced && !this.state.sellFilled) {
-        const sellOnJup = openOrders.find(o => o.id === this.state.sellOrderId);
-        if (!sellOnJup) {
+        if (!orderMap.has(this.state.sellOrderId)) {
           this.state.sellFilled = true;
-          logger.info(`[SELL] Order no longer on Jupiter — assumed filled!`);
+          logger.info(`[SELL] Order gone from Jupiter → filled!`);
         }
       }
     }
@@ -537,13 +527,13 @@ class DCABot {
     await this.saveState();
     this.printStatus();
 
-    // ─── Check if we already exit-ed ───
     if (this.state.sellFilled) {
-      logger.info('Sell already filled — position closed.');
+      await notify('Position already closed — sell was filled.');
       return;
     }
 
     // ─── Main loop ───
+
     while (!this.state.emergencyStop) {
       await this.tick();
       await this.sleep(CHECK_INTERVAL_MS);
@@ -553,12 +543,11 @@ class DCABot {
   }
 
   async tick() {
-    // ── 1. Check filled buy orders ──
+    // 1. Check if buy orders filled
     for (const level of this.state.grid) {
       if (level.status !== 'open') continue;
 
       if (this.isTestMode) {
-        // In test mode, treat as filled on next tick
         level.status = 'filled';
         level.filledPrice = level.limitPrice;
         level.filledAt = Date.now();
@@ -566,28 +555,32 @@ class DCABot {
         logger.info(`[TEST] Order #${level.orderNum} filled`);
       }
 
-      // In live mode, check Jupiter API if the order is gone (it filled)
       if (!this.isTestMode && level.orderId) {
-        const orderDetails = await this.checkOrderStatus(level.orderId);
-        if (orderDetails && orderDetails.filled) {
+        const details = await this.checkOrderStatus(level.orderId);
+        if (details && details.filled) {
           level.status = 'filled';
-          level.filledPrice = orderDetails.filledAvgPrice || level.limitPrice;
+          level.filledPrice = details.filledAvgPrice || level.limitPrice;
           level.filledAt = Date.now();
-          level.filledBaseAmount = orderDetails.filledInputAmount / Math.pow(10, this.state.baseDecimals);
-          logger.info(`Order #${level.orderNum} filled @ $${level.filledPrice.toFixed(6)}`);
+          level.filledBaseAmount = details.filledInputAmount / Math.pow(10, this.state.baseDecimals);
+
+          await notify(
+            `Filled: Order #${level.orderNum}\n` +
+            `${level.filledBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${level.filledPrice.toFixed(6)}\n` +
+            `$${level.sizeUSDC.toFixed(2)} USDC`
+          );
         }
       }
     }
 
-    // ── 2. Recalculate totals from filled orders ──
+    // 2. Recalculate totals
     this.recalculate();
 
-    // ── 3. If we have enough BASE and haven't placed sell, calculate exit ──
-    if (this.state.filledCount > 0 && !this.state.sellOrderPlaced) {
+    // 3. Calculate exit target when we have any filled orders
+    if (this.state.filledCount > 0 && !this.state.sellOrderPlaced && this.state.exitPrice === null) {
       this.state.calculateTargets();
     }
 
-    // ── 4. Place next buy limit order if there's a pending one ──
+    // 4. Place next buy limit if pending
     if (!this.state.allOrdersFilled && !this.state.emergencyStop) {
       const next = this.state.nextPendingOrder;
       if (next) {
@@ -595,15 +588,21 @@ class DCABot {
       }
     }
 
-    // ── 5. If all buys filled (or max reached) and no sell yet, place sell ──
+    // 5. Place sell limit when all buys filled
     if (this.state.allOrdersFilled && !this.state.sellOrderPlaced && !this.state.sellFilled) {
       this.state.calculateTargets();
       await this.placeSellLimit();
     }
 
-    // ── 6. Check sell fill ──
+    // 6. Check sell fill
     if (this.state.sellFilled) {
-      logger.info('✅ Position closed — sell order filled!');
+      const extraVal = this.state.targetExtraBase * (this.state.exitPrice);
+      await notify(
+        `Position closed! ✅\n` +
+        `Invested: $${this.state.totalInvestedUSDC.toFixed(2)} USDC\n` +
+        `Accumulated: ${this.state.totalBaseBought.toFixed(6)} ${BASE_TOKEN}\n` +
+        `Extra profit: +${this.state.targetExtraBase.toFixed(6)} ${BASE_TOKEN} (≈ $${extraVal.toFixed(2)})`
+      );
       this.state.emergencyStop = true;
     }
 
@@ -616,7 +615,7 @@ class DCABot {
     let bought = 0;
 
     for (const level of this.state.grid) {
-      if (level.filledBaseAmount) {
+      if (level.status === 'filled' && level.filledBaseAmount) {
         invested += level.sizeUSDC;
         bought += level.filledBaseAmount;
       }
@@ -631,18 +630,13 @@ class DCABot {
 
   async checkOrderStatus(orderId) {
     try {
-      const resp = await fetch(`${JUP_LIMIT_V4}/order/${orderId}`);
+      const resp = await fetch(`${JUPITER_LIMIT}/order/${orderId}`);
+      if (resp.status === 404) return { filled: true };
       if (!resp.ok) return null;
       const data = await resp.json();
-
-      // If state is 'filled' or order not found → it was filled
       if (data.state === 'filled') {
         return { filled: true, filledAvgPrice: data.filledPrice, filledInputAmount: data.filledInputAmount };
       }
-      if (resp.status === 404) {
-        return { filled: true };
-      }
-
       return { filled: false, state: data.state };
     } catch {
       return null;
@@ -654,30 +648,22 @@ class DCABot {
     logger.info('═'.repeat(72));
     logger.info(`${PAIR} — Entry: ${s.entryPrice ? '$' + s.entryPrice.toFixed(6) : '—'}`);
     logger.info(
-      `Orders: ${s.filledCount}/${MAX_ORDERS} filled | ${s.openOrderCount} open on Jupiter | ` +
-      `$${s.totalInvestedUSDC.toFixed(2)} invested | ${s.totalBaseBought.toFixed(6)} ${BASE_TOKEN}`
+      `Orders: ${s.filledCount}/${MAX_ORDERS} filled | ${s.openOrderCount} open | ` +
+      `$${s.totalInvestedUSDC.toFixed(2)} | ${s.totalBaseBought.toFixed(6)} ${BASE_TOKEN}`
     );
     if (s.exitPrice) {
-      logger.info(`Exit: $${s.exitPrice.toFixed(6)} | Extra: +${s.targetExtraBase.toFixed(6)} ${BASE_TOKEN} | Sell: ${s.sellFilled ? '✅ FILLED' : s.sellOrderPlaced ? '🔄 OPEN' : '⏳ NOT PLACED'}`);
+      logger.info(`Exit: $${s.exitPrice.toFixed(6)} | +${s.targetExtraBase.toFixed(6)} ${BASE_TOKEN} | Sell: ${s.sellFilled ? '✅ filled' : s.sellOrderPlaced ? '🔄 open' : '⏳ not placed'}`);
     }
     if (s.emergencyStop) logger.info(`🛑 EMERGENCY STOP`);
     logger.info('─'.repeat(72));
-    logger.info(
-      `  # ` +
-      `Size`.padStart(8) +
-      `  Drop%` +
-      `  Price`.padStart(10) +
-      `  Status`
-    );
+    logger.info(`  #   Size     Drop%      Price     Status`);
     for (const l of s.grid) {
-      const icon =
-        l.status === 'filled' ? '✓' :
-        l.status === 'open' ? '◌' : '○';
+      const icon = l.status === 'filled' ? '✓' : l.status === 'open' ? '◌' : '○';
       logger.info(
         `${l.orderNum.toString().padStart(3)} ` +
         `$${l.sizeUSDC.toFixed(2)}`.padStart(8) +
-        ` ${l.dropPercent.toFixed(1)}%`.padStart(7) +
-        ` $${l.limitPrice.toFixed(6)}`.padStart(13) +
+        ` ${l.dropPercent.toFixed(1)}% `.padStart(7) +
+        `$${l.limitPrice.toFixed(6)}`.padStart(13) +
         ` ${icon} ${l.status.toUpperCase()}`
       );
     }
