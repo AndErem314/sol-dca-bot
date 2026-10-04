@@ -65,7 +65,7 @@ class Bot {
     this.realizedCycles = 0;
     this.realizedProfitUsd = 0;
     this.realizedExtraBase = 0;
-    this.wallet = { quote: opts.paperBalance ?? 2000, base: 0, escrow: 0 };
+    this.wallet = { quote: opts.paperBalance ?? config.paperBalance ?? 2000, base: 0, escrow: 0 };
     this.stopped = false;
   }
 
@@ -339,7 +339,7 @@ class Bot {
 
   async run() {
     if (this.mode === 'live') await this.initLive();
-    if (!this.broker) this.broker = this.mode === 'paper' ? new PaperBroker(logger) : await this.jupiterBrokerFactory?.();
+    if (!this.broker) this.broker = this.mode === 'paper' ? new PaperBroker(logger, config.paperFeeBps) : await this.jupiterBrokerFactory?.();
     if (!this.broker) throw new Error('No broker available');
     await this.loadState();
     logger.info(`${PAIR} DCA v2 — ${this.mode.toUpperCase()} mode | entry→sequential grid→TP sized to holdings→reset`);

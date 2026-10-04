@@ -68,6 +68,9 @@ const config = {
   // Emergency stop read live (runtime-tunable + test-injectable):
   emergencyStopEnabled: () => process.env.ENABLE_EMERGENCY_STOP === 'true',
   emergencyStopPercent: () => num('EMERGENCY_STOP_PERCENT', 50.0),
+  // Paper mode simulation knobs
+  paperBalance: num('PAPER_BALANCE', 2000),
+  paperFeeBps: num('PAPER_FEE_BPS', 10), // ~Jupiter swap fee, mirrors backtest assumptions
 
   // Accounts / integrations
   privateKey: process.env.PHANTOM_PRIVATE_KEY || null,
