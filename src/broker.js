@@ -18,8 +18,9 @@ const { config } = require('./config');
 // ─── Paper broker ────────────────────────────────────────────────
 
 class PaperBroker {
-  constructor(logger) {
+  constructor(logger, feeBps = 0) {
     this.logger = logger;
+    this.feeBps = feeBps;
     this.orders = new Map(); // id -> order
     this.nextId = 1;
     this.stats = { buysFilled: 0, sellsFilled: 0, cancelOps: 0, volumeQuote: 0 };
@@ -56,8 +57,8 @@ class PaperBroker {
       fills.push({
         orderId: o.id, side: o.side,
         filledPrice: o.limitPrice,           // limit orders fill AT limit (conservative)
-        baseAmount: o.baseAmount,            // expected output for buys / input for sells
-        quoteAmount: o.quoteAmount,
+        baseAmount: o.side === 'buy' ? o.baseAmount * (1 - this.feeBps / 10000) : o.baseAmount,
+        quoteAmount: o.side === 'sell' ? o.quoteAmount * (1 - this.feeBps / 10000) : o.quoteAmount,
       });
       this.logger.info(`[PAPER] fill: ${o.side} ${o.id} @ ${o.limitPrice.toFixed(6)}`);
     }

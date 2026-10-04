@@ -98,3 +98,5 @@ keys/
 *.pem
 *.crt
 *.cert
+# Backtest raw data (regenerate: python3 backtest/fetch-1h.py)
+backtest/data/

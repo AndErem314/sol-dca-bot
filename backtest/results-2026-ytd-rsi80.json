@@ -1,0 +1,243 @@
+{
+  "meta": {
+    "symbol": "SOL/USDT (Binance 1h) as SOL/USDC proxy",
+    "period": "2026-01-01T00:00:00.000Z → 2026-10-04T14:00:00.000Z",
+    "params": {
+      "initialOrder": 10,
+      "multiplier": 1.05,
+      "orders": 30,
+      "dropPct": 1.33,
+      "tpMode": "base",
+      "profitPct": 8,
+      "usdFloorPct": 0.5,
+      "feeBps": 10,
+      "startBalance": 1000
+    },
+    "fillModel": "intra-candle O-L-H-C path, limit fills at limit price, no slippage modeling"
+  },
+  "results": [
+    {
+      "name": "baseline",
+      "closedCycles": 3,
+      "cycleEvents": [
+        {
+          "when": "2026-01-01T00:00",
+          "kind": "ENTRY",
+          "px": 124.64,
+          "rsi1h": null,
+          "rsi4h": null
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "SETTLED",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "ENTRY",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "SETTLED",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "ENTRY",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "SETTLED",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "ENTRY",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        }
+      ],
+      "blockedEntryHours": 0,
+      "realizedUsd": 2.82,
+      "extraSolKept": 0.5039,
+      "extraSolAtEndValue": 61.41,
+      "wallet": {
+        "quote": 925.49,
+        "base": 0.5327
+      },
+      "openCycleAtEnd": {
+        "entry": 122.33,
+        "filled": 4,
+        "invested": 43.1,
+        "holdings": 0.3595
+      },
+      "finalEquityMtm": 1064.93,
+      "minEquity": 701.81,
+      "maxDeployedUSD": 664.39
+    },
+    {
+      "name": "rsi1h>80",
+      "closedCycles": 3,
+      "cycleEvents": [
+        {
+          "when": "2026-01-01T00:00",
+          "kind": "ENTRY",
+          "px": 124.64,
+          "rsi1h": null,
+          "rsi4h": null
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "SETTLED",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "ENTRY",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "SETTLED",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "ENTRY",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "SETTLED",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "ENTRY",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        }
+      ],
+      "blockedEntryHours": 0,
+      "realizedUsd": 2.82,
+      "extraSolKept": 0.5039,
+      "extraSolAtEndValue": 61.41,
+      "wallet": {
+        "quote": 925.49,
+        "base": 0.5327
+      },
+      "openCycleAtEnd": {
+        "entry": 122.33,
+        "filled": 4,
+        "invested": 43.1,
+        "holdings": 0.3595
+      },
+      "finalEquityMtm": 1064.93,
+      "minEquity": 701.81,
+      "maxDeployedUSD": 664.39
+    },
+    {
+      "name": "rsi4h>80",
+      "closedCycles": 3,
+      "cycleEvents": [
+        {
+          "when": "2026-01-01T00:00",
+          "kind": "ENTRY",
+          "px": 124.64,
+          "rsi1h": null,
+          "rsi4h": null
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "SETTLED",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-05T01:00",
+          "kind": "ENTRY",
+          "px": 135.55,
+          "rsi1h": 64.9,
+          "rsi4h": 68.8
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "SETTLED",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-01-13T22:00",
+          "kind": "ENTRY",
+          "px": 143.39,
+          "rsi1h": 60.6,
+          "rsi4h": 65.1
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "SETTLED",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        },
+        {
+          "when": "2026-09-25T11:00",
+          "kind": "ENTRY",
+          "px": 119.18,
+          "rsi1h": 69.9,
+          "rsi4h": 55.2
+        }
+      ],
+      "blockedEntryHours": 0,
+      "realizedUsd": 2.82,
+      "extraSolKept": 0.5039,
+      "extraSolAtEndValue": 61.41,
+      "wallet": {
+        "quote": 925.49,
+        "base": 0.5327
+      },
+      "openCycleAtEnd": {
+        "entry": 122.33,
+        "filled": 4,
+        "invested": 43.1,
+        "holdings": 0.3595
+      },
+      "finalEquityMtm": 1064.93,
+      "minEquity": 701.81,
+      "maxDeployedUSD": 664.39
+    }
+  ],
+  "buyHold": {
+    "name": "buy&hold",
+    "invested": 1000,
+    "sol": 7.9904,
+    "finalValue": 973.63,
+    "ytdPct": -2.64
+  }
+}

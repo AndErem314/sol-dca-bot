@@ -57,6 +57,7 @@ class Bot {
     this.broker = opts.broker || null;
     this.notifier = opts.notifier || null;
     this.priceOverride = opts.priceOverride || null;
+    this.entryFilter = opts.entryFilter || null; // optional: () => bool — gate cycle opening (RSI etc.)
     this.jupiterBrokerFactory = opts.jupiterBrokerFactory || null;
     this.now = opts.now || Date.now;
     this.cycle = null;
@@ -207,16 +208,17 @@ class Bot {
     }
   }
 
-  async settleCycle() {
+  async settleCycle(f) {
     const c = this.cycle;
-    const proceeds = c.sellQuote;
+    const gross = c.sellQuote;
+    const proceeds = (f && typeof f.quoteAmount === 'number' && f.quoteAmount > 0) ? f.quoteAmount : gross;
     const usdPnl = proceeds - c.invested;
     this.realizedCycles += 1;
     this.realizedProfitUsd += usdPnl;
     this.realizedExtraBase += c.keepBase;
-    if (this.mode === 'paper') { this.wallet.escrow -= proceeds; this.wallet.quote += proceeds; }
+    if (this.mode === 'paper') { this.wallet.escrow -= gross; this.wallet.quote += proceeds; }
     await this.notify(
-      `✅ Cycle closed: proceeds $${proceeds.toFixed(2)} vs invested $${c.invested.toFixed(2)} ` +
+      `✅ Cycle closed: proceeds $${proceeds.toFixed(2)} (gross $${gross.toFixed(2)}) vs invested $${c.invested.toFixed(2)} ` +
       `(USD P/L ${usdPnl.toFixed(2)}) | kept ${c.keepBase.toFixed(6)} extra ${config.baseToken}`);
     this.cycle = null;
   }
@@ -277,7 +279,12 @@ class Bot {
     }
     if (c.sellOrderId) {
       const st = await this.broker.status(c.sellOrderId);
-      if (st?.filled) await this.settleCycle();
+      if (st?.filled) {
+        await this.settleCycle({
+          quoteAmount: st.raw?.outputAmount != null
+            ? Number(st.raw.outputAmount) / 10 ** config.quoteDecimals : undefined,
+        });
+      }
       else if (st && ['cancelled', 'expired', 'failed'].includes(st.state)) {
         c.sellOrderId = null; c.sellPlacedPrice = null; // replan will re-place
       }
@@ -297,13 +304,13 @@ class Bot {
           const lvl = c?.grid.find(l => l.orderId === f.orderId);
           if (lvl) await this.applyBuyFill(lvl, f);
         } else if (f.side === 'sell' && this.cycle?.sellOrderId === f.orderId) {
-          await this.settleCycle();
+          await this.settleCycle(f);
         }
       }
     }
 
     if (!this.cycle) {
-      if (!this.stopped) await this.openCycle(price);
+      if (!this.stopped && (!this.entryFilter || this.entryFilter())) await this.openCycle(price);
     } else {
       if (shouldEmergencyStop(price, this.cycle.entryPrice, {
         emergencyStopEnabled: config.emergencyStopEnabled(),
