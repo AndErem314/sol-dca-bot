@@ -1,4 +1,10 @@
-# SOL Profit DCA Strategy
+# SOL Profit Strategy — v1 doc
+
+> ⚠️ **SUPERSEDED (v2, Oct 2026)** — kept for history. The "+8% extra SOL" goal
+> stands, but v1 implemented it by sizing the sell at 108% of holdings (impossible)
+> with the exit below average entry. v2 (`README.md`) sells only what is held:
+> recover capital + USD floor, keep the remainder as the extra-base reward.
+
 
 ## 🎯 Strategy Change: SOL Profit Instead of USD Profit
 

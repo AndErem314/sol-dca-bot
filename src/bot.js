@@ -1,694 +1,369 @@
 #!/usr/bin/env node
-
 /**
- * Solana DCA Trading Bot — Limit Order Edition
+ * Solana DCA Trading Bot — v2 (Jupiter Trigger v1 + paper mode)
  *
- * Uses Jupiter Limit Order API so orders persist on-chain.
+ * Rewritten Oct 2026 after a full audit of the original limit/v4 version,
+ * which could not install (dead npm deps), could not price (dead quote v6),
+ * could not order (limit/v4 never existed), and could not take profit
+ * (sell sized at 108% of holdings; exit price BELOW average entry).
+ * Original kept at src/legacy/bot.v1.js.
  *
- * Flow:
- *   1. Place limit buy orders at grid levels
- *   2. When all fills → place limit sell at exit price
- *   3. Sell fills → keep extra base tokens as profit
+ * Modes:
+ *   --paper   live prices, simulated fills, zero funds at risk   ← default
+ *   --live    real orders via Jupiter Trigger v1 (funded wallet)  ← opt-in
  *
- * Orders live on Jupiter → survive bot restarts.
+ * Lifecycle: sequential grid buys → TP sell sized to holdings → on fill,
+ * realize + RESET cycle. Emergency stop actually cancels and liquidates.
  */
-
-require('dotenv').config();
-const { Connection, Keypair, PublicKey, VersionedTransaction } = require('@solana/web3.js');
-const winston = require('winston');
 const fs = require('fs').promises;
 const path = require('path');
+const winston = require('winston');
+const { config, validateForLive } = require('./config');
+const { getPrice } = require('./marketData');
+const { PaperBroker } = require('./broker');
+const { buildGrid, computeTpPlan, shouldEmergencyStop } = require('./strategy');
 
-// ─── Config ──────────────────────────────────────────────────────
-const PAIR = process.env.PAIR_LABEL || 'SOL/USDC';
-const BASE_TOKEN = process.env.BASE_TOKEN || 'SOL';
-const INITIAL_ORDER = parseFloat(process.env.INITIAL_ORDER || 10.0);
-const ORDER_MULTIPLIER = parseFloat(process.env.ORDER_MULTIPLIER || 1.05);
-const MAX_ORDERS = parseInt(process.env.MAX_SAFETY_ORDERS || 30);
-const PRICE_DROP_PERCENT = parseFloat(process.env.PRICE_DROP_PERCENT || 1.33);
-const PROFIT_TARGET_PERCENT = parseFloat(process.env.PROFIT_TARGET_PERCENT || 8.0);
-const MAX_DRAWDOWN = parseFloat(process.env.MAX_DRAWDOWN_PERCENT || 40.0);
-const ENABLE_EMERGENCY_STOP = process.env.ENABLE_EMERGENCY_STOP === 'true';
-const EMERGENCY_STOP_PCT = parseFloat(process.env.EMERGENCY_STOP_PERCENT || 50.0);
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || 30000);
-
-// Telegram notifications
-const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
-const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
-
-// Jupiter API
-const JUPITER_LIMIT = 'https://jup.ag/api/limit/v4';
-
+const PAIR = config.pairLabel;
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: config.logLevel,
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) =>
-      `${timestamp} [${PAIR}] [${level.toUpperCase()}]: ${message}`
-    )
+    winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${PAIR}] [${level.toUpperCase()}]: ${message}`)
   ),
-  transports: [
-    new winston.transports.Console(),
-    ...(process.env.LOG_TO_FILE === 'true' ? [
-      new winston.transports.File({ filename: `logs/${PAIR.replace('/', '-')}.log` })
-    ] : [])
-  ]
+  transports: [new winston.transports.Console()],
 });
 
-// ─── Grid Builder ────────────────────────────────────────────────
-
-function buildGrid(entryPrice) {
-  const grid = [];
-  let cumulativeUSDC = 0;
-
-  for (let i = 0; i < MAX_ORDERS; i++) {
-    const orderNum = i + 1;
-    const size = INITIAL_ORDER * Math.pow(ORDER_MULTIPLIER, i);
-    const dropPct = i * PRICE_DROP_PERCENT;
-    cumulativeUSDC += size;
-
-    grid.push({
-      orderNum,
-      orderIndex: i,
-      sizeUSDC: size,
-      cumulativeUSDC: Math.round(cumulativeUSDC * 100) / 100,
-      dropPercent: Math.round(dropPct * 100) / 100,
-      limitPrice: Math.round(entryPrice * (1 - dropPct / 100) * 1e8) / 1e8,
-      status: 'pending',
-      orderId: null,
-      filledPrice: null,
-      filledAt: null,
-      filledBaseAmount: null,
-    });
-  }
-
-  return grid;
-}
-
-// ─── Bot State ───────────────────────────────────────────────────
-
-class BotState {
-  constructor() {
-    this.entryPrice = null;
-    this.grid = [];
-    this.totalInvestedUSDC = 0;
-    this.totalBaseBought = 0;
-    this.avgEntryPrice = null;
-    this.targetExtraBase = 0;
-    this.targetTotalBase = 0;
-    this.exitPrice = null;
-    this.emergencyStop = false;
-    this.sellOrderPlaced = false;
+class Cycle {
+  constructor(entryPrice, grid) {
+    this.entryPrice = entryPrice;
+    this.grid = grid;
     this.sellOrderId = null;
-    this.sellFilled = false;
-
-    this.baseMint = null;
-    this.quoteMint = null;
-    this.baseDecimals = 9;
-    this.quoteDecimals = 6;
-    this.connection = null;
-    this.wallet = null;
+    this.sellPlacedPrice = null;
+    this.sellBase = 0;      // base committed to the TP sell order
+    this.sellQuote = 0;     // expected proceeds of that sell
+    this.keepBase = 0;      // extra base deliberately left unsold (the reward)
+    this.startedAt = Date.now();
   }
-
-  get filledCount() {
-    return this.grid.filter(l => l.status === 'filled').length;
-  }
-
-  get openOrderCount() {
-    return this.grid.filter(l => l.status === 'open').length;
-  }
-
-  get nextPendingOrder() {
-    return this.grid.find(l => l.status === 'pending') || null;
-  }
-
-  get allOrdersFilled() {
-    return this.filledCount === MAX_ORDERS;
-  }
-
-  calculateTargets() {
-    if (this.totalBaseBought === 0) return;
-
-    this.targetExtraBase = this.totalBaseBought * (PROFIT_TARGET_PERCENT / 100);
-    this.targetTotalBase = this.totalBaseBought + this.targetExtraBase;
-    this.exitPrice = Math.round((this.totalInvestedUSDC / this.targetTotalBase) * 1e8) / 1e8;
-
-    logger.info(
-      `[TARGET] ${this.totalBaseBought.toFixed(6)} ${BASE_TOKEN} | ` +
-      `exit: $${this.exitPrice.toFixed(6)} | ` +
-      `extra: +${this.targetExtraBase.toFixed(6)} ${BASE_TOKEN} (+${PROFIT_TARGET_PERCENT}%)`
-    );
-
-    if (ENABLE_EMERGENCY_STOP && this.entryPrice) {
-      const dd = ((this.entryPrice - this.exitPrice) / this.entryPrice) * 100;
-      if (dd > MAX_DRAWDOWN + 5) {
-        logger.error(
-          `[EMERGENCY] Exit target ${dd.toFixed(1)}% below entry — exceeds ${MAX_DRAWDOWN}% limit`
-        );
-        this.emergencyStop = true;
-      }
-    }
-  }
+  get filled() { return this.grid.filter(l => l.status === 'filled'); }
+  get nextPending() { return this.grid.find(l => l.status === 'pending') || null; }
+  get invested() { return this.filled.reduce((s, l) => s + l.sizeQuote, 0); }
+  get holdings() { return this.filled.reduce((s, l) => s + (l.filledBaseAmount || 0), 0); }
+  get avgEntry() { const h = this.holdings; return h > 0 ? this.invested / h : 0; }
 }
 
-// ─── Jupiter Limit Order API ───────────────────────────────────
-
-class JupiterLimits {
-  constructor(wallet, connection) {
-    this.wallet = wallet;
-    this.connection = connection;
+class Bot {
+  constructor(opts = {}) {
+    this.mode = opts.mode || 'paper';
+    this.broker = opts.broker || null;
+    this.notifier = opts.notifier || null;
+    this.priceOverride = opts.priceOverride || null;
+    this.jupiterBrokerFactory = opts.jupiterBrokerFactory || null;
+    this.now = opts.now || Date.now;
+    this.cycle = null;
+    this.events = [];
+    this.realizedCycles = 0;
+    this.realizedProfitUsd = 0;
+    this.realizedExtraBase = 0;
+    this.wallet = { quote: opts.paperBalance ?? 2000, base: 0, escrow: 0 };
+    this.stopped = false;
   }
 
-  async createOrder(inputMint, outputMint, inAmount, outAmount) {
-    try {
-      const body = {
-        inputMint,
-        outputMint,
-        inAmount: inAmount.toString(),
-        outAmount: outAmount.toString(),
-        expiredAt: null,
-        publicKey: this.wallet.publicKey.toString(),
-      };
-
-      logger.debug(`[JUP LIMIT] POST /order — ${inAmount} → ${outAmount}`);
-
-      const resp = await fetch(`${JUPITER_LIMIT}/order`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!resp.ok) {
-        const errText = await resp.text().catch(() => '');
-        throw new Error(`Jupiter ${resp.status}: ${errText.slice(0, 200)}`);
-      }
-
-      const data = await resp.json();
-      const orderId = data.orderId;
-      if (!orderId) throw new Error('No orderId in Jupiter response');
-
-      if (data.tx) {
-        const txBuf = Buffer.from(data.tx, 'base64');
-        const tx = VersionedTransaction.deserialize(txBuf);
-        tx.sign([this.wallet]);
-        const txId = await this.connection.sendTransaction(tx, {
-          skipPreflight: true,
-          maxRetries: 2,
-        });
-        logger.info(`[JUP LIMIT] Order ${orderId} — tx: https://solscan.io/tx/${txId}`);
-      } else {
-        logger.info(`[JUP LIMIT] Order ${orderId} created`);
-      }
-
-      return { success: true, orderId };
-    } catch (error) {
-      logger.error(`[JUP LIMIT] Failed: ${error.message}`);
-      return { success: false, error: error.message };
-    }
+  async notify(msg) {
+    logger.info(`📢 ${msg.replace(/\n/g, ' | ')}`);
+    this.events.push({ t: this.now(), msg });
+    if (this.notifier) await this.notifier(msg).catch(() => {});
   }
 
-  async getOpenOrders() {
-    try {
-      const resp = await fetch(
-        `${JUPITER_LIMIT}/orders?wallet=${this.wallet.publicKey.toString()}&state=open`
-      );
-      if (!resp.ok) return [];
-      return await resp.json();
-    } catch {
-      return [];
-    }
-  }
-
-  async cancelOrder(orderId) {
-    try {
-      const resp = await fetch(`${JUPITER_LIMIT}/order`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId,
-          publicKey: this.wallet.publicKey.toString(),
-        }),
-      });
-      return resp.ok;
-    } catch {
-      return false;
-    }
-  }
-}
-
-// ─── Telegram Notifications ──────────────────────────────────────
-
-async function notify(message) {
-  const header = `🔔 [${PAIR}]`;
-  const fullMessage = `${header}\n${message}`;
-
-  logger.info(`📢 ${message.replace(/\n/g, '\n   ')}`);
-
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    return; // Telegram not configured — silently skip
-  }
-
-  try {
-    const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TG_CHAT_ID,
-        text: fullMessage,
-        parse_mode: null, // plain text
-        disable_web_page_preview: true,
-      }),
-    });
-    if (!resp.ok) {
-      const body = await resp.text();
-      logger.warn(`Telegram send failed: ${resp.status} ${body.slice(0, 200)}`);
-    }
-  } catch (err) {
-    logger.warn(`Telegram notification error: ${err.message}`);
-  }
-}
-
-// ─── Bot ─────────────────────────────────────────────────────────
-
-class DCABot {
-  constructor() {
-    this.state = new BotState();
-    this.jup = null;
-    this.isTestMode = process.argv.includes('--test');
-  }
-
-  async init() {
-    logger.info(`Initializing ${PAIR} DCA Bot (limit orders)...`);
-    logger.info(`  Base: ${BASE_TOKEN} (${process.env.BASE_MINT})`);
-    logger.info(`  Quote: ${PAIR.split('/')[1]} (${process.env.QUOTE_MINT})`);
-    logger.info(`  Grid: $${INITIAL_ORDER} × ${ORDER_MULTIPLIER}x, ${MAX_ORDERS} levels, ${PRICE_DROP_PERCENT}% spacing`);
-
-    this.state.baseMint = new PublicKey(process.env.BASE_MINT);
-    this.state.quoteMint = new PublicKey(process.env.QUOTE_MINT);
-    this.state.baseDecimals = parseInt(process.env.BASE_DECIMALS || 9);
-    this.state.quoteDecimals = parseInt(process.env.QUOTE_DECIMALS || 6);
-
-    const connection = new Connection(
-      process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
-      'confirmed'
-    );
-    this.state.connection = connection;
-
-    const pk = process.env.PHANTOM_PRIVATE_KEY;
-    if (!pk) throw new Error('PHANTOM_PRIVATE_KEY not set');
-
-    const wallet = Keypair.fromSecretKey(Buffer.from(pk, 'base64'));
-    this.state.wallet = wallet;
-
-    logger.info(`  Wallet: ${wallet.publicKey.toString()}`);
-    this.jup = new JupiterLimits(wallet, connection);
-
-    // Balances
-    try {
-      const solBal = await connection.getBalance(wallet.publicKey);
-      logger.info(`  SOL: ${(solBal / 1e9).toFixed(4)}`);
-    } catch {}
-
-    if (TG_BOT_TOKEN && TG_CHAT_ID) {
-      logger.info(`  Telegram: ${TG_CHAT_ID}`);
-    } else {
-      logger.info(`  Telegram: not configured`);
-    }
-
-    logger.info(`Ready${this.isTestMode ? ' (TEST MODE)' : ''}`);
-  }
-
-  async getPrice() {
-    try {
-      const params = new URLSearchParams({
-        inputMint: this.state.baseMint.toString(),
-        outputMint: this.state.quoteMint.toString(),
-        amount: Math.pow(10, this.state.baseDecimals).toString(),
-        slippageBps: '50',
-      });
-      const resp = await fetch(`https://quote-api.jup.ag/v6/quote?${params}`);
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      return parseInt(data.outAmount) / Math.pow(10, this.state.quoteDecimals);
-    } catch {
-      return null;
-    }
-  }
-
-  // ─── State Persistence ───────────────────────────────────────
+  // ── persistence ────────────────────────────────────────────────
+  stateFile() { return path.join(process.cwd(), 'state', `${PAIR.replace('/', '-')}.${this.mode}.json`); }
 
   async saveState() {
-    const dir = path.join(process.cwd(), 'state');
-    await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${PAIR.replace('/', '-')}.json`);
-    await fs.writeFile(file, JSON.stringify({
-      entryPrice: this.state.entryPrice,
-      grid: this.state.grid,
-      totalInvestedUSDC: this.state.totalInvestedUSDC,
-      totalBaseBought: this.state.totalBaseBought,
-      avgEntryPrice: this.state.avgEntryPrice,
-      exitPrice: this.state.exitPrice,
-      emergencyStop: this.state.emergencyStop,
-      sellOrderPlaced: this.state.sellOrderPlaced,
-      sellOrderId: this.state.sellOrderId,
-      sellFilled: this.state.sellFilled,
-      savedAt: Date.now(),
+    await fs.mkdir(path.join(process.cwd(), 'state'), { recursive: true });
+    await fs.writeFile(this.stateFile(), JSON.stringify({
+      mode: this.mode, pair: PAIR,
+      cycle: this.cycle,
+      realizedCycles: this.realizedCycles,
+      realizedProfitUsd: this.realizedProfitUsd,
+      realizedExtraBase: this.realizedExtraBase,
+      wallet: this.wallet,
+      events: this.events.slice(-500),
+      savedAt: this.now(),
     }, null, 2));
   }
 
   async loadState() {
-    const file = path.join(process.cwd(), 'state', `${PAIR.replace('/', '-')}.json`);
     try {
-      const raw = await fs.readFile(file, 'utf8');
-      const data = JSON.parse(raw);
-      const ageMin = Math.round((Date.now() - data.savedAt) / 60000);
-      logger.info(`Loaded state (saved ${ageMin}m ago)`);
-      this.state.entryPrice = data.entryPrice;
-      this.state.grid = data.grid;
-      this.state.totalInvestedUSDC = data.totalInvestedUSDC || 0;
-      this.state.totalBaseBought = data.totalBaseBought || 0;
-      this.state.avgEntryPrice = data.avgEntryPrice;
-      this.state.exitPrice = data.exitPrice;
-      this.state.emergencyStop = data.emergencyStop;
-      this.state.sellOrderPlaced = data.sellOrderPlaced;
-      this.state.sellOrderId = data.sellOrderId;
-      this.state.sellFilled = data.sellFilled;
+      const data = JSON.parse(await fs.readFile(this.stateFile(), 'utf8'));
+      if (data.cycle?.entryPrice) {
+        const c = new Cycle(data.cycle.entryPrice, data.cycle.grid || []);
+        Object.assign(c, data.cycle);
+        this.cycle = c;
+      }
+      Object.assign(this, {
+        realizedCycles: data.realizedCycles || 0,
+        realizedProfitUsd: data.realizedProfitUsd || 0,
+        realizedExtraBase: data.realizedExtraBase || 0,
+      });
+      if (data.wallet) this.wallet = data.wallet;
+      this.events = data.events || [];
       return true;
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
-  // ─── Place Buy Limit Order ───────────────────────────────────
+  async tickPrice() {
+    if (this.priceOverride) return this.priceOverride();
+    const { price } = await getPrice(logger);
+    return price;
+  }
 
-  async placeBuyLimit(level) {
-    if (this.isTestMode) {
-      logger.info(`[TEST] Buy limit: $${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)}`);
-      return { success: true, orderId: `test-order-${level.orderNum}` };
-    }
+  // ── lifecycle ──────────────────────────────────────────────────
+  async openCycle(price) {
+    this.cycle = new Cycle(price, buildGrid(price, {
+      initialOrder: config.initialOrder,
+      orderMultiplier: config.orderMultiplier,
+      maxOrders: config.maxOrders,
+      priceDropPercent: config.priceDropPercent,
+    }));
+    await this.notify(
+      `Cycle #${this.realizedCycles + 1} opened @ $${price.toFixed(6)} | ` +
+      `${config.maxOrders} levels, ${config.priceDropPercent}% spacing, ${config.orderMultiplier}x sizing`);
+  }
 
-    const inAmount = Math.floor(level.sizeUSDC * Math.pow(10, this.state.quoteDecimals));
-    const outAmount = Math.floor((level.sizeUSDC / level.limitPrice) * Math.pow(10, this.state.baseDecimals) * 0.998);
-
-    logger.info(
-      `[BUY LIMIT] #${level.orderNum}: $${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)} ` +
-      `(→ ${(outAmount / Math.pow(10, this.state.baseDecimals)).toFixed(6)} ${BASE_TOKEN})`
-    );
-
-    const result = await this.jup.createOrder(
-      this.state.quoteMint.toString(),
-      this.state.baseMint.toString(),
-      inAmount,
-      outAmount,
-    );
-
-    if (result.success) {
+  async placeBuy(level) {
+    const expectedBase = level.sizeQuote / level.limitPrice;
+    const res = await this.broker.place({
+      side: 'buy',
+      quoteAmount: level.sizeQuote, baseAmount: expectedBase, limitPrice: level.limitPrice,
+      makingAtomic: Math.floor(level.sizeQuote * 10 ** config.quoteDecimals),
+      takingAtomic: Math.floor(expectedBase * 10 ** config.baseDecimals),
+      isSell: false,
+    });
+    if (res.success) {
       level.status = 'open';
-      level.orderId = result.orderId;
-      await this.saveState();
-
-      await notify(
-        `Buy limit #${level.orderNum} placed\n` +
-        `$${level.sizeUSDC.toFixed(2)} @ $${level.limitPrice.toFixed(6)}\n` +
-        `Drop: ${level.dropPercent.toFixed(1)}% from entry\n` +
-        `Order: ${result.orderId}`
-      );
+      level.orderId = res.orderId;
+      if (this.mode === 'paper') { this.wallet.quote -= level.sizeQuote; this.wallet.escrow += level.sizeQuote; }
     }
-
-    return result;
+    return res;
   }
 
-  // ─── Place Sell Limit Order ──────────────────────────────────
+  /** Sequential arming: only place the next grid level once the previous filled. */
+  async placeNextBuy() {
+    const c = this.cycle;
+    const idx = c.grid.findIndex(l => l.status === 'pending');
+    if (idx === -1) return;
+    if (idx > 0 && c.grid[idx - 1].status !== 'filled') return; // wait for previous fill
+    return this.placeBuy(c.grid[idx]);
+  }
 
-  async placeSellLimit() {
-    if (this.state.sellOrderPlaced || this.state.totalBaseBought === 0) return;
+  async applyBuyFill(level, f) {
+    const c = this.cycle;
+    level.status = 'filled';
+    level.filledPrice = f.filledPrice;
+    level.filledAt = this.now();
+    level.filledBaseAmount = f.baseAmount;
+    if (this.mode === 'paper') { this.wallet.escrow -= level.sizeQuote; this.wallet.base += f.baseAmount; }
+    await this.notify(
+      `Buy #${level.orderNum} filled: ${f.baseAmount.toFixed(6)} ${config.baseToken} @ $${f.filledPrice.toFixed(6)} | ` +
+      `cycle ${c.filled.length}/${c.grid.length}, invested $${c.invested.toFixed(2)}, avg $${c.avgEntry.toFixed(6)}`);
+  }
 
-    const sellBaseAmount = this.state.targetTotalBase > 0
-      ? this.state.totalInvestedUSDC / this.state.exitPrice
-      : this.state.totalBaseBought;
+  /** Compute TP and (re)place the sell; never sells more than held. */
+  async replanTp() {
+    const c = this.cycle;
+    if (!(c.holdings > 0)) return;
+    const plan = computeTpPlan(
+      { invested: c.invested, holdings: c.holdings, avgEntry: c.avgEntry },
+      { mode: config.tpMode(), profitTargetPercent: config.profitTargetPercent, minUsdProfitPct: config.minUsdProfitPct() });
+    if (!plan?.armed) return;
 
-    const keepAmount = this.state.targetExtraBase;
+    if (c.sellOrderId && c.sellPlacedPrice && Math.abs(plan.exitPrice - c.sellPlacedPrice) < 1e-12) return;
 
-    if (sellBaseAmount <= 0) {
-      logger.warn('[SELL] Nothing to sell');
-      return;
+    // refund the old sell reservation before replacing it
+    if (c.sellOrderId) {
+      const ok = await this.broker.cancel(c.sellOrderId);
+      if (ok && this.mode === 'paper') { this.wallet.base += c.sellBase; this.wallet.escrow -= c.sellQuote; }
+      else if (!ok && this.mode === 'live') { logger.warn('cancel of stale sell failed — skipping replan this tick'); return; }
     }
 
-    if (this.isTestMode) {
-      logger.info(`[TEST] Sell limit: ${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)}`);
-      this.state.sellOrderId = 'test-sell';
-      this.state.sellOrderPlaced = true;
-      return;
-    }
-
-    const inAmount = Math.floor(sellBaseAmount * Math.pow(10, this.state.baseDecimals));
-    const outAmount = Math.floor(this.state.totalInvestedUSDC * Math.pow(10, this.state.quoteDecimals));
-
-    logger.info(
-      `[SELL LIMIT] ${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)} ` +
-      `→ $${this.state.totalInvestedUSDC.toFixed(2)} USDC (keep ${keepAmount.toFixed(6)} extra ${BASE_TOKEN})`
-    );
-
-    const result = await this.jup.createOrder(
-      this.state.baseMint.toString(),
-      this.state.quoteMint.toString(),
-      inAmount,
-      outAmount,
-    );
-
-    if (result.success) {
-      this.state.sellOrderId = result.orderId;
-      this.state.sellOrderPlaced = true;
-      await this.saveState();
-
-      await notify(
-        `Sell limit placed\n` +
-        `${sellBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${this.state.exitPrice.toFixed(6)}\n` +
-        `→ $${this.state.totalInvestedUSDC.toFixed(2)} USDC\n` +
-        `+${keepAmount.toFixed(6)} extra ${BASE_TOKEN} profit\n` +
-        `Order: ${result.orderId}`
-      );
+    const sellBase = Math.min(plan.sellBase, c.holdings);  // THE bug fix: ≤ holdings, always
+    const sellQuote = sellBase * plan.exitPrice;
+    const res = await this.broker.place({
+      side: 'sell',
+      quoteAmount: sellQuote, baseAmount: sellBase, limitPrice: plan.exitPrice,
+      makingAtomic: Math.floor(sellBase * 10 ** config.baseDecimals),
+      takingAtomic: Math.floor(sellQuote * 10 ** config.quoteDecimals),
+      isSell: true,
+    });
+    if (res.success) {
+      c.sellOrderId = res.orderId;
+      c.sellPlacedPrice = plan.exitPrice;
+      c.sellBase = sellBase;
+      c.sellQuote = sellQuote;
+      c.keepBase = plan.keepBase ?? (c.holdings - sellBase);
+      if (this.mode === 'paper') { this.wallet.base -= sellBase; this.wallet.escrow += sellQuote; }
+      await this.notify(
+        `TP armed: sell ${sellBase.toFixed(6)} ${config.baseToken} @ $${plan.exitPrice.toFixed(6)} ` +
+        `(keep ${c.keepBase.toFixed(6)} extra) | needs +${(plan.exitPrice / c.avgEntry * 100 - 100).toFixed(1)}% over avg`);
     }
   }
 
-  // ─── Main Loop ───────────────────────────────────────────────
+  async settleCycle() {
+    const c = this.cycle;
+    const proceeds = c.sellQuote;
+    const usdPnl = proceeds - c.invested;
+    this.realizedCycles += 1;
+    this.realizedProfitUsd += usdPnl;
+    this.realizedExtraBase += c.keepBase;
+    if (this.mode === 'paper') { this.wallet.escrow -= proceeds; this.wallet.quote += proceeds; }
+    await this.notify(
+      `✅ Cycle closed: proceeds $${proceeds.toFixed(2)} vs invested $${c.invested.toFixed(2)} ` +
+      `(USD P/L ${usdPnl.toFixed(2)}) | kept ${c.keepBase.toFixed(6)} extra ${config.baseToken}`);
+    this.cycle = null;
+  }
+
+  async emergencyStop(price) {
+    const c = this.cycle;
+    await this.notify(`🛑 EMERGENCY STOP @ $${price.toFixed(6)} — cancelling all orders, liquidating.`);
+    for (const l of c.grid) {
+      if (l.status === 'open' && l.orderId) {
+        const ok = await this.broker.cancel(l.orderId);
+        if (ok && this.mode === 'paper') { this.wallet.escrow -= l.sizeQuote; this.wallet.quote += l.sizeQuote; }
+        l.status = 'cancelled'; l.orderId = null;
+      }
+    }
+    if (c.sellOrderId) {
+      const ok = await this.broker.cancel(c.sellOrderId);
+      if (ok && this.mode === 'paper') { this.wallet.base += c.sellBase; this.wallet.escrow -= c.sellQuote; }
+      c.sellOrderId = null;
+    }
+    const freeBase = this.mode === 'paper' ? this.wallet.base : c.holdings;
+    if (freeBase > 0) {
+      const px = price * 0.995; // marketable limit → triggers instantly
+      const res = await this.broker.place({
+        side: 'sell', quoteAmount: freeBase * px, baseAmount: freeBase, limitPrice: px,
+        makingAtomic: Math.floor(freeBase * 10 ** config.baseDecimals),
+        takingAtomic: Math.floor(freeBase * px * 10 ** config.quoteDecimals),
+        isSell: true,
+      });
+      if (res.success && this.mode === 'paper') {
+        this.wallet.base -= freeBase; this.wallet.escrow += freeBase * px;
+        const fills = this.broker.match(price);
+        for (const f of fills) if (f.side === 'sell') {
+          this.wallet.escrow -= f.quoteAmount; this.wallet.quote += f.quoteAmount;
+          await this.notify(`Liquidated ${f.baseAmount.toFixed(6)} ${config.baseToken} → $${f.quoteAmount.toFixed(2)}`);
+        }
+      }
+    }
+    this.cycle = null;
+    this.stopped = true;
+    await this.saveState();
+  }
+
+  // ── live fill reconciliation ───────────────────────────────────
+  async reconcileLive() {
+    const c = this.cycle;
+    if (!c) return;
+    for (const l of c.grid) {
+      if (l.status !== 'open' || !l.orderId) continue;
+      const st = await this.broker.status(l.orderId);
+      if (st?.filled) {
+        const baseAmt = st.raw?.outputAmount != null
+          ? Number(st.raw.outputAmount) / 10 ** config.baseDecimals
+          : l.sizeQuote / l.limitPrice;
+        await this.applyBuyFill(l, { side: 'buy', filledPrice: l.limitPrice, baseAmount: baseAmt, orderId: l.orderId });
+      } else if (st && ['cancelled', 'expired', 'failed'].includes(st.state)) {
+        l.status = 'pending'; l.orderId = null; // re-arm on next tick
+      }
+    }
+    if (c.sellOrderId) {
+      const st = await this.broker.status(c.sellOrderId);
+      if (st?.filled) await this.settleCycle();
+      else if (st && ['cancelled', 'expired', 'failed'].includes(st.state)) {
+        c.sellOrderId = null; c.sellPlacedPrice = null; // replan will re-place
+      }
+    }
+  }
+
+  // ── main loop ──────────────────────────────────────────────────
+  async tick() {
+    const price = await this.tickPrice();
+    this.lastPrice = price;
+    if (!price) { logger.warn('No price available this tick — skipping'); return; }
+
+    if (this.mode === 'paper') {
+      for (const f of this.broker.match(price)) {
+        if (f.side === 'buy') {
+          const c = this.cycle;
+          const lvl = c?.grid.find(l => l.orderId === f.orderId);
+          if (lvl) await this.applyBuyFill(lvl, f);
+        } else if (f.side === 'sell' && this.cycle?.sellOrderId === f.orderId) {
+          await this.settleCycle();
+        }
+      }
+    }
+
+    if (!this.cycle) {
+      if (!this.stopped) await this.openCycle(price);
+    } else {
+      if (shouldEmergencyStop(price, this.cycle.entryPrice, {
+        emergencyStopEnabled: config.emergencyStopEnabled(),
+        emergencyStopPercent: config.emergencyStopPercent(),
+      })) {
+        await this.emergencyStop(price);
+        return;
+      }
+      await this.placeNextBuy();
+      if (this.mode === 'live') await this.reconcileLive();
+      await this.replanTp();
+    }
+    await this.saveState();
+  }
+
+  printStatus(price) {
+    const c = this.cycle;
+    logger.info(`── ${PAIR} [${this.mode.toUpperCase()}] @ $${price?.toFixed?.(6) ?? '—'} | closed cycles: ${this.realizedCycles} | realized USD: $${this.realizedProfitUsd.toFixed(2)} ──`);
+    if (c) {
+      logger.info(`  entry $${c.entryPrice.toFixed(6)} | filled ${c.filled.length}/${c.grid.length} | invested $${c.invested.toFixed(2)} | ${c.holdings.toFixed(6)} ${config.baseToken} @ avg $${c.avgEntry.toFixed(6)}${c.sellPlacedPrice ? ` | TP sell @ $${c.sellPlacedPrice.toFixed(6)} (keep ${c.keepBase.toFixed(4)})` : ''}`);
+    }
+    if (this.mode === 'paper') {
+      logger.info(`  wallet: $${this.wallet.quote.toFixed(2)} + ${this.wallet.base.toFixed(6)} ${config.baseToken} | escrow $${this.wallet.escrow.toFixed(2)}`);
+    }
+  }
 
   async run() {
-    await this.init();
-
-    const hadState = await this.loadState();
-
-    if (!hadState || !this.state.entryPrice) {
-      const price = await this.getPrice();
-      if (!price) {
-        logger.error('Cannot fetch initial price. Exiting.');
-        process.exit(1);
-      }
-
-      this.state.entryPrice = price;
-      this.state.grid = buildGrid(price);
-      await this.saveState();
-
-      await notify(
-        `Position opened\n` +
-        `Entry: $${price.toFixed(6)}\n` +
-        `Grid: ${MAX_ORDERS} levels, ${PRICE_DROP_PERCENT}% spacing\n` +
-        `$${INITIAL_ORDER} initial, ${ORDER_MULTIPLIER}x multiplier`
-      );
-    }
-
-    if (this.state.grid.length === 0) {
-      this.state.grid = buildGrid(this.state.entryPrice);
-    }
-
-    // Reconcile with Jupiter open orders
-    if (!this.isTestMode) {
-      const openOrders = await this.jup.getOpenOrders();
-      const orderMap = new Map(openOrders.map(o => [o.id, o]));
-
-      for (const level of this.state.grid) {
-        if (level.status === 'open' && level.orderId) {
-          if (!orderMap.has(level.orderId)) {
-            level.status = 'filled';
-            logger.info(`Order #${level.orderNum} (${level.orderId}) gone from Jupiter → filled`);
-          }
-        }
-      }
-
-      if (this.state.sellOrderId && this.state.sellOrderPlaced && !this.state.sellFilled) {
-        if (!orderMap.has(this.state.sellOrderId)) {
-          this.state.sellFilled = true;
-          logger.info(`[SELL] Order gone from Jupiter → filled!`);
-        }
-      }
-    }
-
-    await this.saveState();
-    this.printStatus();
-
-    if (this.state.sellFilled) {
-      await notify('Position already closed — sell was filled.');
-      return;
-    }
-
-    // ─── Main loop ───
-
-    while (!this.state.emergencyStop) {
+    if (this.mode === 'live') await this.initLive();
+    if (!this.broker) this.broker = this.mode === 'paper' ? new PaperBroker(logger) : await this.jupiterBrokerFactory?.();
+    if (!this.broker) throw new Error('No broker available');
+    await this.loadState();
+    logger.info(`${PAIR} DCA v2 — ${this.mode.toUpperCase()} mode | entry→sequential grid→TP sized to holdings→reset`);
+    while (!this.stopped) {
       await this.tick();
-      await this.sleep(CHECK_INTERVAL_MS);
+      this.printStatus(this.lastPrice);
+      await new Promise(r => setTimeout(r, config.intervalSeconds * 1000));
     }
-
     logger.info('Bot stopped.');
   }
 
-  async tick() {
-    // 1. Check if buy orders filled
-    for (const level of this.state.grid) {
-      if (level.status !== 'open') continue;
-
-      if (this.isTestMode) {
-        level.status = 'filled';
-        level.filledPrice = level.limitPrice;
-        level.filledAt = Date.now();
-        level.filledBaseAmount = level.sizeUSDC / level.limitPrice;
-        logger.info(`[TEST] Order #${level.orderNum} filled`);
-      }
-
-      if (!this.isTestMode && level.orderId) {
-        const details = await this.checkOrderStatus(level.orderId);
-        if (details && details.filled) {
-          level.status = 'filled';
-          level.filledPrice = details.filledAvgPrice || level.limitPrice;
-          level.filledAt = Date.now();
-          level.filledBaseAmount = details.filledInputAmount / Math.pow(10, this.state.baseDecimals);
-
-          await notify(
-            `Filled: Order #${level.orderNum}\n` +
-            `${level.filledBaseAmount.toFixed(6)} ${BASE_TOKEN} @ $${level.filledPrice.toFixed(6)}\n` +
-            `$${level.sizeUSDC.toFixed(2)} USDC`
-          );
-        }
-      }
+  async initLive() {
+    const problems = validateForLive(config);
+    if (problems.length) {
+      logger.error(`Refusing LIVE start: ${problems.join('; ')}. Use --paper for simulation.`);
+      process.exit(2);
     }
-
-    // 2. Recalculate totals
-    this.recalculate();
-
-    // 3. Calculate exit target when we have any filled orders
-    if (this.state.filledCount > 0 && !this.state.sellOrderPlaced && this.state.exitPrice === null) {
-      this.state.calculateTargets();
-    }
-
-    // 4. Place next buy limit if pending
-    if (!this.state.allOrdersFilled && !this.state.emergencyStop) {
-      const next = this.state.nextPendingOrder;
-      if (next) {
-        await this.placeBuyLimit(next);
-      }
-    }
-
-    // 5. Place sell limit when all buys filled
-    if (this.state.allOrdersFilled && !this.state.sellOrderPlaced && !this.state.sellFilled) {
-      this.state.calculateTargets();
-      await this.placeSellLimit();
-    }
-
-    // 6. Check sell fill
-    if (this.state.sellFilled) {
-      const extraVal = this.state.targetExtraBase * (this.state.exitPrice);
-      await notify(
-        `Position closed! ✅\n` +
-        `Invested: $${this.state.totalInvestedUSDC.toFixed(2)} USDC\n` +
-        `Accumulated: ${this.state.totalBaseBought.toFixed(6)} ${BASE_TOKEN}\n` +
-        `Extra profit: +${this.state.targetExtraBase.toFixed(6)} ${BASE_TOKEN} (≈ $${extraVal.toFixed(2)})`
-      );
-      this.state.emergencyStop = true;
-    }
-
-    this.printStatus();
-    await this.saveState();
-  }
-
-  recalculate() {
-    let invested = 0;
-    let bought = 0;
-
-    for (const level of this.state.grid) {
-      if (level.status === 'filled' && level.filledBaseAmount) {
-        invested += level.sizeUSDC;
-        bought += level.filledBaseAmount;
-      }
-    }
-
-    this.state.totalInvestedUSDC = Math.round(invested * 100) / 100;
-    this.state.totalBaseBought = bought;
-    if (bought > 0) {
-      this.state.avgEntryPrice = this.state.totalInvestedUSDC / bought;
-    }
-  }
-
-  async checkOrderStatus(orderId) {
-    try {
-      const resp = await fetch(`${JUPITER_LIMIT}/order/${orderId}`);
-      if (resp.status === 404) return { filled: true };
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      if (data.state === 'filled') {
-        return { filled: true, filledAvgPrice: data.filledPrice, filledInputAmount: data.filledInputAmount };
-      }
-      return { filled: false, state: data.state };
-    } catch {
-      return null;
-    }
-  }
-
-  printStatus() {
-    const s = this.state;
-    logger.info('═'.repeat(72));
-    logger.info(`${PAIR} — Entry: ${s.entryPrice ? '$' + s.entryPrice.toFixed(6) : '—'}`);
-    logger.info(
-      `Orders: ${s.filledCount}/${MAX_ORDERS} filled | ${s.openOrderCount} open | ` +
-      `$${s.totalInvestedUSDC.toFixed(2)} | ${s.totalBaseBought.toFixed(6)} ${BASE_TOKEN}`
-    );
-    if (s.exitPrice) {
-      logger.info(`Exit: $${s.exitPrice.toFixed(6)} | +${s.targetExtraBase.toFixed(6)} ${BASE_TOKEN} | Sell: ${s.sellFilled ? '✅ filled' : s.sellOrderPlaced ? '🔄 open' : '⏳ not placed'}`);
-    }
-    if (s.emergencyStop) logger.info(`🛑 EMERGENCY STOP`);
-    logger.info('─'.repeat(72));
-    logger.info(`  #   Size     Drop%      Price     Status`);
-    for (const l of s.grid) {
-      const icon = l.status === 'filled' ? '✓' : l.status === 'open' ? '◌' : '○';
-      logger.info(
-        `${l.orderNum.toString().padStart(3)} ` +
-        `$${l.sizeUSDC.toFixed(2)}`.padStart(8) +
-        ` ${l.dropPercent.toFixed(1)}% `.padStart(7) +
-        `$${l.limitPrice.toFixed(6)}`.padStart(13) +
-        ` ${icon} ${l.status.toUpperCase()}`
-      );
-    }
-    logger.info('═'.repeat(72));
-  }
-
-  sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
+    const { Connection, Keypair } = require('@solana/web3.js');
+    const { JupiterBroker } = require('./broker');
+    const connection = new Connection(config.rpcEndpoint, 'confirmed');
+    const wallet = Keypair.fromSecretKey(Buffer.from(config.privateKey, 'base64'));
+    const sol = await connection.getBalance(wallet.publicKey);
+    logger.info(`LIVE wallet ${wallet.publicKey.toString()} | ${(sol / 1e9).toFixed(4)} SOL`);
+    if (sol / 1e9 < config.minBaseForFees) logger.warn(`SOL below ${config.minBaseForFees} — orders may fail on fees`);
+    this.broker = new JupiterBroker(logger, wallet, connection);
   }
 }
 
-// ─── Signals ─────────────────────────────────────────────────────
+module.exports = { Bot, Cycle };
 
-let bot;
-process.on('SIGINT', () => {
-  logger.info('SIGINT — saving state...');
-  if (bot) bot.saveState().finally(() => process.exit(0));
-});
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM — saving state...');
-  if (bot) bot.saveState().finally(() => process.exit(0));
-});
-
-bot = new DCABot();
-bot.run().catch(e => {
-  logger.error(`Fatal: ${e.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  const mode = process.argv.includes('--live') ? 'live' : 'paper';
+  new Bot({ mode }).run().catch(e => { logger.error(`Fatal: ${e.message}`); process.exit(1); });
+}

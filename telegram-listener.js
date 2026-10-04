@@ -6,15 +6,15 @@
  * - Responds to commands: /start, /status, /pause, /resume, /cancel
  * - Acts as a relay between the DCA bot and Andrey
  */
-require('dotenv').config({ path: '/home/andrey/.openclaw/.env' });
+require('dotenv').config({ path: process.env.STATE_ENV_FILE || '.env' });
 
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const BOT_TOKEN = process.env.SOL_DCA_BOT_TOKEN;
-const ALLOWED_USER = 1771741539; // Andrey's Telegram ID
-const STATE_DIR = '/home/andrey/.openclaw/workspace/skills/coding-assistant/sol-dca-bot/state';
+const BOT_TOKEN = process.env.SOL_DCA_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+const ALLOWED_USER = parseInt(process.env.ALLOWED_TELEGRAM_USER || '1771741539', 10); // Andrey's Telegram ID
+const STATE_DIR = process.env.STATE_DIR || require('path').join(process.cwd(), 'state');
 
 if (!BOT_TOKEN) {
   console.error('SOL_DCA_BOT_TOKEN not set');

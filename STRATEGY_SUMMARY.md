@@ -1,5 +1,13 @@
 # SOL/USDT DCA Bot Strategy Summary
 
+> ⚠️ **SUPERSEDED (v2, Oct 2026).** The numbers below describe the v1 design,
+> which had two fatal flaws found in audit: the take-profit sell was sized at
+> **108% of holdings** (unfillable) and the exit price sat **below average
+> entry** (no real profit). Jupiter's `limit/v4` API referenced throughout v1
+> never existed. Current behavior is documented in `README.md`; v1 code is in
+> `src/legacy/`.
+
+
 ## 🎯 Strategy Overview
 **Pyramiding Dollar Cost Averaging (DCA) bot** for SOL/USDT on Jupiter Exchange using Phantom wallet.
 

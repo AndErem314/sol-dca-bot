@@ -1,143 +1,62 @@
 #!/usr/bin/env node
-
 /**
- * Utility to check Phantom wallet balances
+ * Utility: wallet balance checker (v2).
+ * Uses plain RPC + Jupiter Price v3 — the old version imported @jup-ag/api v3
+ * Jupiter.load()/computeRoutes() which no longer exists on npm.
  */
-
-require('dotenv').config();
+require('dotenv').config({ path: process.env.PAIR_FILE || '.env' });
 const { Connection, Keypair, PublicKey } = require('@solana/web3.js');
-const { Jupiter } = require('@jup-ag/api');
+const { config } = require('../config');
 
 async function checkBalances() {
-  console.log('🔍 Checking Phantom Wallet Balances...');
-  console.log('='.repeat(50));
-  
-  try {
-    // Initialize connection
-    const connection = new Connection(
-      process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
-      'confirmed'
-    );
-    
-    // Initialize wallet
-    const privateKey = process.env.PHANTOM_PRIVATE_KEY;
-    if (!privateKey) {
-      console.error('❌ PHANTOM_PRIVATE_KEY not found in .env file');
-      process.exit(1);
-    }
-    
-    const wallet = Keypair.fromSecretKey(
-      Buffer.from(privateKey, 'base64')
-    );
-    
-    console.log(`Wallet: ${wallet.publicKey.toString()}`);
-    console.log();
-    
-    // Check SOL balance
-    const solBalance = await connection.getBalance(wallet.publicKey);
-    const solBalanceSol = solBalance / 1e9;
-    
-    console.log('💰 SOL Balance:');
-    console.log(`  ${solBalanceSol.toFixed(6)} SOL`);
-    console.log(`  ${solBalance} lamports`);
-    console.log();
-    
-    // Check token balances
-    console.log('💎 Token Balances:');
-    
-    // Common token mints
-    const tokens = {
-      'USDT': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-      'USDC': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      'BONK': 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
-      'RAY': '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
-    };
-    
-    for (const [symbol, mint] of Object.entries(tokens)) {
-      try {
-        const tokenAccounts = await connection.getTokenAccountsByOwner(
-          wallet.publicKey,
-          { mint: new PublicKey(mint) }
-        );
-        
-        if (tokenAccounts.value.length > 0) {
-          const accountInfo = await connection.getTokenAccountBalance(
-            tokenAccounts.value[0].pubkey
-          );
-          
-          let decimals = 6; // Default
-          if (symbol === 'SOL') decimals = 9;
-          if (symbol === 'BONK') decimals = 5;
-          
-          const balance = accountInfo.value.uiAmount || 0;
-          console.log(`  ${symbol}: ${balance.toFixed(4)}`);
-        }
-      } catch (error) {
-        // Token might not exist in wallet
-      }
-    }
-    
-    console.log();
-    
-    // Get current SOL price
-    console.log('📈 Current Prices:');
-    try {
-      const jupiter = await Jupiter.load({
-        connection,
-        wallet: wallet.publicKey,
-        cluster: 'mainnet-beta',
-      });
-      
-      const routes = await jupiter.computeRoutes({
-        inputMint: new PublicKey(tokens.USDT),
-        outputMint: new PublicKey('So11111111111111111111111111111111111111112'), // SOL
-        inputAmount: 1000000, // 1 USDT
-        slippageBps: 50,
-      });
-      
-      if (routes.routesInfos && routes.routesInfos.length > 0) {
-        const solPrice = 1 / (routes.routesInfos[0].outAmount / 1e9);
-        console.log(`  SOL/USDT: $${solPrice.toFixed(2)}`);
-        
-        // Calculate portfolio value
-        const solValue = solBalanceSol * solPrice;
-        console.log(`  SOL Value: $${solValue.toFixed(2)}`);
-      }
-    } catch (error) {
-      console.log(`  SOL price: Error fetching (${error.message})`);
-    }
-    
-    console.log();
-    
-    // Check if balances meet minimum requirements
-    const minSol = parseFloat(process.env.MIN_SOL_BALANCE || 0.1);
-    const minUsdt = parseFloat(process.env.MIN_USDT_BALANCE || 20.0);
-    
-    console.log('⚡ Minimum Requirements:');
-    console.log(`  Minimum SOL: ${minSol} SOL (for transaction fees)`);
-    console.log(`  Minimum USDT: $${minUsdt} USDT (for trading)`);
-    
-    if (solBalanceSol < minSol) {
-      console.log(`  ⚠️  LOW SOL BALANCE: ${solBalanceSol.toFixed(4)} SOL < ${minSol} SOL`);
-      console.log('     Deposit more SOL for transaction fees');
-    } else {
-      console.log(`  ✅ SOL balance sufficient: ${solBalanceSol.toFixed(4)} SOL`);
-    }
-    
-    console.log();
-    console.log('💡 Tips:');
-    console.log('  • Keep at least 0.1 SOL for transaction fees');
-    console.log('  • USDT is needed for buying SOL');
-    console.log('  • Monitor balances regularly');
-    
-  } catch (error) {
-    console.error(`❌ Error checking balances: ${error.message}`);
+  const connection = new Connection(config.rpcEndpoint, 'confirmed');
+
+  let publicKey;
+  if (config.privateKey && config.privateKey !== 'your_private_key_base64_here') {
+    publicKey = Keypair.fromSecretKey(Buffer.from(config.privateKey, 'base64')).publicKey;
+  } else if (process.env.PHANTOM_PUBLIC_KEY && process.env.PHANTOM_PUBLIC_KEY !== 'your_public_key_here') {
+    publicKey = new PublicKey(process.env.PHANTOM_PUBLIC_KEY);
+  } else {
+    console.error('❌ Set PHANTOM_PRIVATE_KEY or PHANTOM_PUBLIC_KEY in the env file');
     process.exit(1);
   }
-}
+  console.log(`Wallet: ${publicKey.toString()}`);
 
-if (require.main === module) {
-  checkBalances();
-}
+  const sol = (await connection.getBalance(publicKey)) / 1e9;
+  console.log(`SOL:  ${sol.toFixed(6)}${sol < config.minBaseForFees ? '  ⚠️ below fee minimum' : ''}`);
 
-module.exports = { checkBalances };
+  for (const [label, mint] of [
+    [`quote(${(process.env.PAIR_LABEL || 'USDC').split('/')[1]})`, config.quoteMint],
+    [config.baseToken, config.baseMint],
+  ].filter(([, m]) => m)) {
+    try {
+      const accounts = await connection.getTokenAccountsByOwner(publicKey, { mint: new PublicKey(mint) });
+      let bal = 0;
+      for (const a of accounts.value) {
+        const info = await connection.getTokenAccountBalance(a.pubkey);
+        bal += info.value.uiAmount || 0;
+      }
+      console.log(`${label}: ${bal.toFixed(6)}`);
+    } catch (e) {
+      console.log(`${label}: error (${e.message})`);
+    }
+  }
+
+  // USD value via Price v3 (verified live Oct 2026)
+  try {
+    const ids = [
+      'So11111111111111111111111111111111111111112',
+      config.baseMint, config.quoteMint,
+    ].filter(Boolean).join(',');
+    const resp = await fetch(`https://lite-api.jup.ag/price/v3?ids=${ids}`, { signal: AbortSignal.timeout(10000) });
+    const prices = await resp.json();
+    const usdOf = (mint) => prices?.[mint]?.usdPrice;
+    console.log(`SOL: $${usdOf('So11111111111111111111111111111111111111112') ?? '?'}`);
+    if (config.baseMint && config.baseMint !== 'So11111111111111111111111111111111111111112') {
+      console.log(`${config.baseToken}: $${usdOf(config.baseMint) ?? '?'}`);
+    }
+  } catch (e) {
+    console.log(`price: error (${e.message})`);
+  }
+}
+if (require.main === module) checkBalances();

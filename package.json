@@ -1,13 +1,12 @@
 {
   "name": "sol-dca-bot",
-  "version": "1.0.0",
-  "description": "SOL/USDT DCA Trading Bot for Jupiter Exchange with Phantom Wallet",
+  "version": "2.0.0",
+  "description": "Multi-pair DCA bot for Solana tokens via Jupiter Trigger (limit orders), Phantom wallet. Paper + live modes.",
   "main": "src/bot.js",
   "scripts": {
     "start": "node src/bot.js",
-    "start-sol-profit": "node src/bot_sol_profit.js",
-    "test": "node src/bot.js --test",
-    "test-sol-profit": "node src/bot_sol_profit.js --test",
+    "start:live": "node src/bot.js --live",
+    "test": "node --test \"tests/**/*.test.js\"",
     "check-balance": "node src/utils/checkBalance.js",
     "calculate": "node src/utils/calculateOrders.js",
     "lint": "eslint src/",
@@ -25,13 +24,9 @@
   "author": "AndreyE.",
   "license": "MIT",
   "dependencies": {
-    "@jup-ag/api": "^3.2.0",
-    "@project-serum/anchor": "^0.29.0",
-    "@solana/web3.js": "^1.87.6",
-    "axios": "^1.6.0",
+    "@solana/web3.js": "^1.95.0",
     "dotenv": "^16.3.0",
-    "winston": "^3.11.0",
-    "ws": "^8.14.0"
+    "winston": "^3.11.0"
   },
   "devDependencies": {
     "eslint": "^8.53.0",
